@@ -6,7 +6,7 @@ import pandas as pd
 import json
 
 from all22.db import initialize, transaction
-from all22.tracking import BoxTracker, detect_clip, fuse_sources, project_source
+from all22.tracking import BoxTracker, _on_field_detections, detect_clip, fuse_sources, project_source
 
 
 class FakeDetector:
@@ -49,6 +49,15 @@ def test_box_tracker_preserves_nearby_tracks():
     first = tracker.update(np.array([[10, 10, 20, 30], [100, 10, 110, 30]]), (100, 200))
     second = tracker.update(np.array([[12, 10, 22, 30], [98, 10, 108, 30]]), (100, 200))
     assert first == second
+
+
+def test_people_outside_field_region_are_filtered():
+    frame = np.zeros((100, 200, 3), np.uint8)
+    frame[:, 50:150] = (30, 120, 40)
+    boxes = np.asarray([[80, 20, 100, 80], [0, 20, 20, 80]], float)
+    kept, scores = _on_field_detections(frame, boxes, np.asarray([.9, .8]), margin_pixels=2)
+    assert kept.shape == (1, 4)
+    assert scores.tolist() == [.9]
 
 
 def test_fuse_sources_averages_nearby_field_positions(tmp_path: Path):

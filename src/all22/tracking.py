@@ -112,6 +112,35 @@ def _appearance_features(frame: np.ndarray, box: np.ndarray) -> dict:
             "hsv_h": float(hsv[0]), "hsv_s": float(hsv[1]), "hsv_v": float(hsv[2])}
 
 
+def _on_field_detections(frame: np.ndarray, boxes: np.ndarray, scores: np.ndarray,
+                         margin_pixels: int = 18) -> tuple[np.ndarray, np.ndarray]:
+    """Remove people whose ground-contact point is outside the playing surface."""
+    boxes = np.asarray(boxes).reshape((-1, 4))
+    scores = np.asarray(scores)
+    if not len(boxes):
+        return boxes, scores
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (22, 25, 25), (105, 255, 255))
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, np.ones((21, 21), np.uint8))
+    contours, _ = cv2.findContours(green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return boxes, scores
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < frame.shape[0] * frame.shape[1] * .12:
+        return boxes, scores
+    mask = np.zeros(frame.shape[:2], np.uint8)
+    cv2.drawContours(mask, [cv2.convexHull(contour)], -1, 255, -1)
+    mask = cv2.dilate(mask, np.ones((2 * margin_pixels + 1, 2 * margin_pixels + 1), np.uint8))
+    height, width = mask.shape
+    keep = []
+    for box in boxes:
+        x = int(np.clip(round((float(box[0]) + float(box[2])) / 2), 0, width - 1))
+        y = int(np.clip(round(float(box[3])), 0, height - 1))
+        keep.append(bool(mask[y, x]))
+    keep = np.asarray(keep, dtype=bool)
+    return boxes[keep], scores[keep]
+
+
 def _clip_record(db_path: Path, clip_id: str):
     with connect(db_path) as connection:
         row = connection.execute(
@@ -153,6 +182,7 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
                 break
             if decoded % every == 0:
                 boxes, scores = detector.predict(frame)
+                boxes, scores = _on_field_detections(frame, boxes, scores)
                 for detection_index, (box, score) in enumerate(zip(boxes, scores)):
                     x1, y1, x2, y2 = (float(value) for value in box)
                     records.append({"game_id": source["game_id"], "clip_id": clip_id,
@@ -249,6 +279,7 @@ def detect_source(db_path: Path, play_id: str, source_order: int, output: Path,
                 break
             if decoded % every == 0:
                 boxes, scores = detector.predict(frame)
+                boxes, scores = _on_field_detections(frame, boxes, scores)
                 ids = tracker.update(boxes, frame.shape[:2])
                 for track_id, box, score in zip(ids, boxes, scores):
                     x1, y1, x2, y2 = (float(value) for value in box)

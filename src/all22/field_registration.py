@@ -289,7 +289,8 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
         field_points.extend([[float(x), 0.0], [float(x), FIELD_WIDTH]])
     calibration = estimate_homography(image_points, field_points)
     semantic_matrix, semantic_diagnostics = _number_anchored_homography(
-        lines, field_x, recognized, frame.shape)
+        lines, field_x, recognized, frame.shape) if absolute else (
+            None, {"semantic_number_fit": False, "semantic_reason": "absolute_x_unresolved"})
     if semantic_matrix is not None:
         # Preserve point-pair storage compatibility while retaining the
         # semantically constrained matrix during temporal propagation.
