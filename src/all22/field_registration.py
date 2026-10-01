@@ -256,6 +256,18 @@ def _read_frame(capture: cv2.VideoCapture, timestamp: float) -> np.ndarray:
     return frame
 
 
+def _propagate_to_time(capture: cv2.VideoCapture, source_time: float, source_frame: np.ndarray,
+                       target_time: float, registration: Registration) -> tuple[np.ndarray, Registration]:
+    steps = max(1, int(np.ceil(abs(target_time - source_time) / .5)))
+    frame = source_frame
+    value = registration
+    for timestamp in np.linspace(source_time, target_time, steps + 1)[1:]:
+        following = _read_frame(capture, float(timestamp))
+        value = propagate_registration(frame, following, value)
+        frame = following
+    return frame, value
+
+
 def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                         reader=None) -> list[dict]:
     from .db import connect
@@ -287,6 +299,7 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     previous_frame = None
     previous_registration = None
+    previous_time = None
     try:
         for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
             selected = None
@@ -303,18 +316,19 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                     errors.append(f"{candidate_time:.2f}s: unanchored/{candidate.confidence:.2f}")
                 except ValueError as error:
                     errors.append(f"{candidate_time:.2f}s: {error}")
-            if selected is None and previous_frame is not None and previous_registration is not None:
+            if (selected is None and previous_frame is not None and previous_registration is not None
+                    and previous_time is not None):
                 candidate_time = sample_time
-                frame = _read_frame(capture, candidate_time)
                 try:
-                    registration = propagate_registration(previous_frame, frame, previous_registration)
+                    frame, registration = _propagate_to_time(
+                        capture, previous_time, previous_frame, candidate_time, previous_registration)
                     selected = (candidate_time, frame, registration)
                 except ValueError as error:
                     errors.append(f"temporal propagation: {error}")
             if selected is None:
                 raise ValueError("Automatic registration failed near keyframe: " + "; ".join(errors))
             candidate_time, frame, registration = selected
-            previous_frame, previous_registration = frame, registration
+            previous_time, previous_frame, previous_registration = candidate_time, frame, registration
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
