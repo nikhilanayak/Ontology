@@ -283,6 +283,32 @@ def _propagate_to_time(capture: cv2.VideoCapture, source_time: float, source_fra
     return frame, value
 
 
+def _propagate_toward(capture: cv2.VideoCapture, source_time: float, source_frame: np.ndarray,
+                      target_time: float, registration: Registration,
+                      maximum_step_s: float = .5) -> tuple[float, np.ndarray, Registration, Optional[str]]:
+    """Propagate as far as possible without discarding a valid interior anchor.
+
+    Tight crops and graphics at either edge of an otherwise useful camera shot
+    can make ORB registration impossible.  Those frames should delimit the
+    calibrated interval, not invalidate every absolute field observation in
+    the shot.
+    """
+    steps = max(1, int(np.ceil(abs(target_time - source_time) / maximum_step_s)))
+    timestamp = source_time
+    frame = source_frame
+    value = registration
+    for candidate_time in np.linspace(source_time, target_time, steps + 1)[1:]:
+        try:
+            following = _read_frame(capture, float(candidate_time))
+            following_value = propagate_registration(frame, following, value)
+        except ValueError as error:
+            return timestamp, frame, value, str(error)
+        timestamp = float(candidate_time)
+        frame = following
+        value = following_value
+    return timestamp, frame, value, None
+
+
 def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                         reader=None) -> list[dict]:
     from .db import connect
@@ -304,10 +330,6 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
         raise ValueError(f"No camera shot found: {clip_id}")
     start, end = float(clip["start_s"]), float(clip["end_s"])
     duration = end - start
-    keyframe_fractions = (.04, .5, .96) if duration >= 4 else (.08, .92)
-    sample_times = [start + duration * fraction for fraction in keyframe_fractions]
-    stored_times = [start + duration * index / (len(sample_times) - 1)
-                    for index in range(len(sample_times))]
     capture = cv2.VideoCapture(clip["video_path"])
     if not capture.isOpened():
         raise ValueError(f"Could not open {clip['video_path']}")
@@ -344,36 +366,59 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                 f"{item.get('lines', 0)} lines/conf {item.get('confidence', 0):.2f}"
                 for item in attempts)
             raise ValueError(f"No absolute numbered-field anchor found after scanning the shot: {summary}")
-        for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
-            propagation_errors = []
-            selected = None
-            for _, anchor_time, anchor_frame, anchor in sorted(
-                    anchors, key=lambda item: (abs(item[1] - sample_time), -item[0])):
-                try:
-                    if abs(sample_time - anchor_time) < .05:
-                        frame, registration = anchor_frame, anchor
-                    else:
-                        frame, registration = _propagate_to_time(
-                            capture, anchor_time, anchor_frame, sample_time, anchor)
-                    selected = (anchor_time, frame, registration)
-                    break
-                except ValueError as error:
-                    propagation_errors.append(f"{anchor_time:.2f}s: {error}")
-            if selected is None:
-                raise ValueError(
-                    f"Numbered anchors were found, but none tracked to {sample_time:.2f}s: "
-                    + "; ".join(propagation_errors))
-            anchor_time, frame, registration = selected
+        # Absolute OCR/line solutions are evidence in their own right.  Retain
+        # the best one in each short temporal neighborhood, then use temporal
+        # registration only to extend the first and last anchors toward the
+        # shot boundaries.  A failed extension now produces a shorter verified
+        # interval instead of failing the entire shot.
+        selected_anchors = []
+        for item in sorted(anchors, key=lambda value: value[1]):
+            if selected_anchors and item[1] - selected_anchors[-1][1] < .65:
+                if item[0] > selected_anchors[-1][0]:
+                    selected_anchors[-1] = item
+            else:
+                selected_anchors.append(item)
+        candidates = [(time, frame, registration, time, None)
+                      for _, time, frame, registration in selected_anchors]
+        for target, source in ((start, selected_anchors[0]), (end, selected_anchors[-1])):
+            _, anchor_time, anchor_frame, anchor = source
+            reached_time, reached_frame, reached, error = _propagate_toward(
+                capture, anchor_time, anchor_frame, target, anchor)
+            if abs(reached_time - anchor_time) >= .20:
+                candidates.append((reached_time, reached_frame, reached, anchor_time, error))
+
+        # Collapse timestamps reached from different anchors, preferring the
+        # higher-confidence registration at each instant.
+        selected = []
+        for candidate in sorted(candidates, key=lambda value: value[0]):
+            if selected and abs(candidate[0] - selected[-1][0]) < .10:
+                if candidate[2].confidence > selected[-1][2].confidence:
+                    selected[-1] = candidate
+            else:
+                selected.append(candidate)
+        coverage = selected[-1][0] - selected[0][0]
+        minimum_coverage = min(1.0, duration * .15)
+        if len(selected) < 2 or coverage < minimum_coverage:
+            raise ValueError(
+                f"Absolute anchors covered only {coverage:.2f}s of this {duration:.2f}s shot")
+
+        for index, (timestamp, frame, registration, anchor_time, extension_error) in enumerate(selected):
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
-                "timestamp_s": stored_time,
+                "timestamp_s": timestamp,
                 "image_points": registration.image_points,
                 "field_points": registration.field_points,
-                "source": "automatic_lines_ocr_v1",
+                "source": "automatic_lines_ocr_v2_partial_interval",
                 "registration_confidence": registration.confidence,
-                "registration_diagnostics": registration.diagnostics,
-                "sample_timestamp_s": sample_time,
+                "registration_diagnostics": {
+                    **registration.diagnostics,
+                    "calibrated_start_s": selected[0][0],
+                    "calibrated_end_s": selected[-1][0],
+                    "shot_coverage_fraction": coverage / max(duration, 1e-6),
+                    "extension_error": extension_error,
+                },
+                "sample_timestamp_s": timestamp,
                 "anchor_timestamp_s": anchor_time,
                 "diagnostic_image": str(output.resolve()),
             })
@@ -418,7 +463,20 @@ def auto_reconstruct_game(db_path: Path, game_id: str, output_root: Path,
                 db_path, clip_id, output_root / "calibration-diagnostics", reader=reader)
             reconstruction = reconstruct_clip(
                 db_path, clip_id, Path(row["detections"]), output_root)
+            projection = reconstruction["projection"]
+            tracking = reconstruction["tracking"]
+            quality_reasons = []
+            if projection["valid_fraction"] < .75:
+                quality_reasons.append("calibration_coverage_below_75_percent")
+            if projection["on_field_fraction"] < .75:
+                quality_reasons.append("on_field_detections_below_75_percent")
+            if not 18 <= tracking["reliable_tracks"] <= 35:
+                quality_reasons.append("implausible_reliable_track_count")
+            if not reconstruction["actions"]:
+                quality_reasons.append("no_live_action_detected")
             results.append({"clip_id": clip_id, "status": "created",
+                            "quality_status": "review" if quality_reasons else "usable",
+                            "quality_reasons": quality_reasons,
                             "keyframes": len(keyframes), "reconstruction": reconstruction})
         except (ValueError, RuntimeError) as error:
             results.append({"clip_id": clip_id, "status": "failed", "error": str(error)})
