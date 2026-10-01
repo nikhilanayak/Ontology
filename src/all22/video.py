@@ -89,6 +89,7 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
         raise RuntimeError("Could not open FFmpeg motion-analysis pipe")
     samples: List[MotionSample] = []
     previous = None
+    previous_histogram = None
     frame_bytes = width * height * 3
     frame_index = 0
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
@@ -101,8 +102,12 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             timestamp = start_s + frame_index / sample_fps
             frame_index += 1
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            histogram = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
+            cv2.normalize(histogram, histogram)
             if previous is None:
                 previous = gray
+                previous_histogram = histogram
                 continue
             points = cv2.goodFeaturesToTrack(previous, maxCorners=400, qualityLevel=.01,
                                              minDistance=4, blockSize=5)
@@ -121,15 +126,23 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
                 matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
             stabilized = cv2.warpAffine(previous, matrix, (width, height), flags=cv2.INTER_LINEAR)
             difference = cv2.absdiff(stabilized, gray)
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             green = cv2.inRange(hsv, (25, 35, 25), (105, 255, 255))
             field = cv2.morphologyEx(green, cv2.MORPH_CLOSE, close_kernel)
             field = cv2.dilate(field, close_kernel, iterations=1)
             values = difference[field > 0]
             raw_score = float(np.percentile(values, 90)) if values.size >= 1000 else 0.0
-            camera_cut = inlier_ratio < .18 or raw_score >= 65
+            # A low affine inlier ratio is common during a live play because
+            # many tracked corners belong to players.  It is therefore not a
+            # scene-cut signal.  Color-distribution discontinuity is much more
+            # selective and does not split a play merely because the camera
+            # starts panning.
+            histogram_distance = cv2.compareHist(
+                previous_histogram, histogram, cv2.HISTCMP_BHATTACHARYYA
+            )
+            camera_cut = histogram_distance >= .42 or raw_score >= 85
             samples.append(MotionSample(timestamp, 0.0 if camera_cut else raw_score, camera_cut))
             previous = gray
+            previous_histogram = histogram
     finally:
         process.stdout.close()
         stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
@@ -142,20 +155,33 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
 
 
 def action_windows_from_motion(samples: List[MotionSample], sample_fps: float = 5.0,
-                               minimum_s: float = 1.5, maximum_s: float = 14.0) -> List[ActionWindow]:
+                               minimum_s: float = 2.0, maximum_s: float = 18.0) -> List[ActionWindow]:
     if len(samples) < 10:
         return []
     scores = np.asarray([sample.score for sample in samples], dtype=float)
-    smoothed = np.convolve(scores, np.ones(3) / 3, mode="same")
+    smoothed = np.convolve(scores, np.ones(5) / 5, mode="same")
     usable = smoothed[np.asarray([not sample.camera_cut for sample in samples])]
     if not usable.size:
         return []
     baseline = float(np.percentile(usable, 35))
     mad = float(np.median(np.abs(usable - np.median(usable)))) or 1.0
-    threshold = max(float(np.percentile(usable, 65)), baseline + 2.0 * mad)
-    active = smoothed >= threshold
-    # Never bridge a camera cut; bridge brief quiet periods within an action.
-    maximum_gap = max(1, round(sample_fps * .8))
+    high_threshold = max(float(np.percentile(usable, 67)), baseline + 1.5 * mad)
+    low_threshold = max(float(np.percentile(usable, 42)), baseline + .35 * mad)
+    seeds = smoothed >= high_threshold
+    active = seeds.copy()
+    # Grow strong motion through weaker intervals. This captures the whole
+    # snap-to-whistle burst rather than just its fastest two or three seconds.
+    for index in np.flatnonzero(seeds):
+        cursor = index - 1
+        while cursor >= 0 and not samples[cursor].camera_cut and smoothed[cursor] >= low_threshold:
+            active[cursor] = True
+            cursor -= 1
+        cursor = index + 1
+        while cursor < len(active) and not samples[cursor].camera_cut and smoothed[cursor] >= low_threshold:
+            active[cursor] = True
+            cursor += 1
+    # Never bridge a real camera cut; bridge short lulls within an action.
+    maximum_gap = max(1, round(sample_fps * 1.4))
     for index in range(1, len(active) - 1):
         if active[index] or samples[index].camera_cut:
             continue
