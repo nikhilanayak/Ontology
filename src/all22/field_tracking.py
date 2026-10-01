@@ -198,6 +198,7 @@ class FieldSpaceTracker:
         self.nominal_detection_counts: list[int] = []
         self.active: list[FieldTrack] = []
         self.next_id = 1
+        self.last_crowd_burst = False
 
     def _appearance(self, detections: pd.DataFrame) -> np.ndarray:
         values = np.full((len(detections), len(self.appearance_columns)), np.nan, dtype=float)
@@ -280,6 +281,7 @@ class FieldSpaceTracker:
         self.active = [track for track in self.active if track.missed <= self.maximum_missed]
         nominal = float(np.median(self.nominal_detection_counts)) if self.nominal_detection_counts else len(detections)
         crowd_burst = len(detections) > max(self.crowd_floor, self.crowd_multiplier * nominal)
+        self.last_crowd_burst = crowd_burst
         if not crowd_burst:
             self.nominal_detection_counts.append(len(detections))
             self.nominal_detection_counts = self.nominal_detection_counts[-30:]
@@ -319,6 +321,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         if value.empty:
             continue
         value["track_id"] = [f"{clip_id}:t{item}" for item in ids]
+        value["crowd_burst"] = tracker.last_crowd_burst
         active = {track.track_id: track for track in tracker.active}
         value["vx"] = [float(active[item].velocity[0]) for item in ids]
         value["vy"] = [float(active[item].velocity[1]) for item in ids]
@@ -336,7 +339,10 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     # trajectories that should drive action discovery and the tactical map.
     result["track_reliable"] = result.track_coverage >= .35
     reliable = result[result.track_reliable]
-    roster_scores = reliable.groupby("track_id").agg(
+    burst_times = result.loc[result.crowd_burst, "video_timestamp"]
+    roster_pool = (reliable[reliable.video_timestamp < float(burst_times.min())]
+                   if len(burst_times) else reliable)
+    roster_scores = roster_pool.groupby("track_id").agg(
         observations=("track_id", "size"),
         mean_confidence=("confidence", "mean") if "confidence" in reliable else ("track_id", "size"),
         median_speed=("speed", "median"),
