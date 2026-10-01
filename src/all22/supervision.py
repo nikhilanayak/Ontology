@@ -233,9 +233,7 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
             if not path.exists():
                 continue
             tracks = pd.read_parquet(path)
-            if "roster_candidate" in tracks and bool(tracks.roster_candidate.any()):
-                tracks = tracks[tracks.roster_candidate].copy()
-            elif "track_reliable" in tracks and bool(tracks.track_reliable.any()):
+            if "track_reliable" in tracks and bool(tracks.track_reliable.any()):
                 tracks = tracks[tracks.track_reliable].copy()
             ranked = []
             for row in candidates:

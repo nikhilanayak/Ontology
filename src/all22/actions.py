@@ -60,9 +60,7 @@ def discover_action_candidates(tracks: pd.DataFrame, clip_start: float, clip_end
     if tracks.empty or not required.issubset(tracks.columns):
         return []
     frame = tracks.sort_values(["track_id", "video_timestamp"]).copy()
-    if "roster_candidate" in frame and bool(frame.roster_candidate.any()):
-        frame = frame[frame.roster_candidate].copy()
-    elif "track_reliable" in frame and bool(frame.track_reliable.any()):
+    if "track_reliable" in frame and bool(frame.track_reliable.any()):
         frame = frame[frame.track_reliable].copy()
     if "speed" not in frame or not np.isfinite(pd.to_numeric(frame["speed"], errors="coerce")).any():
         elapsed = frame.groupby("track_id").video_timestamp.diff()
