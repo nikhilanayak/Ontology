@@ -18,6 +18,7 @@ class Calibration:
     inlier_ratio: float
     median_error_yards: float
     p95_error_yards: float
+    inlier_p95_error_yards: float
 
 
 def estimate_homography(image_points: Iterable[Tuple[float, float]], field_points: Iterable[Tuple[float, float]]) -> Calibration:
@@ -30,7 +31,9 @@ def estimate_homography(image_points: Iterable[Tuple[float, float]], field_point
         raise ValueError("Homography estimation failed")
     projected = cv2.perspectiveTransform(image.reshape(-1, 1, 2), matrix).reshape(-1, 2)
     errors = np.linalg.norm(projected - field, axis=1)
-    return Calibration(matrix, float(mask.mean()), float(np.median(errors)), float(np.percentile(errors, 95)))
+    inliers = errors[mask.reshape(-1).astype(bool)]
+    return Calibration(matrix, float(mask.mean()), float(np.median(errors)), float(np.percentile(errors, 95)),
+                       float(np.percentile(inliers, 95)) if len(inliers) else float("inf"))
 
 
 def project_points(matrix: np.ndarray, points: Iterable[Tuple[float, float]]) -> np.ndarray:

@@ -204,8 +204,11 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
         spacing_cv = float(np.std(spacing) / max(abs(np.mean(spacing)), 1e-9))
     else:
         spacing_cv = 1.0
+    # Hough extension can produce a bad endpoint where a sideline is hidden.
+    # RANSAC exists to discard exactly those correspondences, so gate on its
+    # consensus rather than allowing one rejected endpoint to poison the fit.
     geometric_ok = (calibration.inlier_ratio >= .65 and calibration.median_error_yards <= 1.5
-                    and calibration.p95_error_yards <= 4.0)
+                    and calibration.inlier_p95_error_yards <= 2.0)
     confidence = float(np.clip(.25 + .08 * min(len(lines), 6) + .2 * absolute
                                - .2 * min(spacing_cv, 1), 0, 1)) if geometric_ok else 0.0
     diagnostics = {"line_count": len(lines), "ocr_numbers": len(recognized),
@@ -214,7 +217,8 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
                    "white_fraction": float((white > 0).mean()),
                    "inlier_ratio": calibration.inlier_ratio,
                    "median_error_yards": calibration.median_error_yards,
-                   "p95_error_yards": calibration.p95_error_yards}
+                   "p95_error_yards": calibration.p95_error_yards,
+                   "inlier_p95_error_yards": calibration.inlier_p95_error_yards}
     return Registration(image_points, field_points, calibration.matrix, confidence, absolute, diagnostics)
 
 
@@ -298,48 +302,61 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
         ).fetchone()
     if not clip:
         raise ValueError(f"No camera shot found: {clip_id}")
-    duration = float(clip["end_s"] - clip["start_s"])
-    fractions = (.15, .5, .85) if duration >= 4 else (.2, .8)
-    sample_times = [float(clip["start_s"]) + duration * fraction for fraction in fractions]
-    stored_times = [float(clip["start_s"]) + duration * index / (len(sample_times) - 1)
+    start, end = float(clip["start_s"]), float(clip["end_s"])
+    duration = end - start
+    keyframe_fractions = (.04, .5, .96) if duration >= 4 else (.08, .92)
+    sample_times = [start + duration * fraction for fraction in keyframe_fractions]
+    stored_times = [start + duration * index / (len(sample_times) - 1)
                     for index in range(len(sample_times))]
     capture = cv2.VideoCapture(clip["video_path"])
     if not capture.isOpened():
         raise ValueError(f"Could not open {clip['video_path']}")
     payload = {"keyframes": []}
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
-    previous_frame = None
-    previous_registration = None
-    previous_time = None
     try:
+        # Painted numbers need to be readable only once anywhere in the shot.
+        # Scan first, choose the strongest absolute anchor, then carry that
+        # geometry in both directions using the no-hard-cut invariant.
+        scan_count = min(25, max(5, int(np.ceil(duration / .75)) + 1))
+        scan_times = np.linspace(start + min(.2, duration * .05),
+                                 end - min(.2, duration * .05), scan_count)
+        anchors = []
+        attempts = []
+        for candidate_time in scan_times:
+            try:
+                candidate_frame = _read_frame(capture, float(candidate_time))
+                candidate = register_field(candidate_frame, reader=reader)
+                diagnostics = candidate.diagnostics
+                attempts.append({"timestamp_s": float(candidate_time),
+                                 "numbers": diagnostics["ocr_numbers"],
+                                 "lines": diagnostics["line_count"],
+                                 "absolute": candidate.absolute_x,
+                                 "confidence": candidate.confidence})
+                if candidate.absolute_x and candidate.confidence >= .5:
+                    score = (candidate.confidence + .03 * min(diagnostics["ocr_numbers"], 3)
+                             + .01 * min(diagnostics["line_count"], 8))
+                    anchors.append((score, float(candidate_time), candidate_frame, candidate))
+            except ValueError as error:
+                attempts.append({"timestamp_s": float(candidate_time), "error": str(error)})
+        if not anchors:
+            summary = "; ".join(
+                f"{item['timestamp_s']:.2f}s: {item.get('numbers', 0)} numbers/"
+                f"{item.get('lines', 0)} lines/conf {item.get('confidence', 0):.2f}"
+                for item in attempts)
+            raise ValueError(f"No absolute numbered-field anchor found after scanning the shot: {summary}")
+        _, anchor_time, anchor_frame, anchor = max(anchors, key=lambda item: item[0])
+
         for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
-            selected = None
-            errors = []
-            for offset in (0, -.5, .5, -1.0, 1.0):
-                candidate_time = min(float(clip["end_s"]) - .1,
-                                     max(float(clip["start_s"]) + .1, sample_time + offset))
-                try:
-                    candidate_frame = _read_frame(capture, candidate_time)
-                    candidate = register_field(candidate_frame, reader=reader)
-                    if candidate.absolute_x and candidate.confidence >= .5:
-                        selected = (candidate_time, candidate_frame, candidate)
-                        break
-                    errors.append(f"{candidate_time:.2f}s: unanchored/{candidate.confidence:.2f}")
-                except ValueError as error:
-                    errors.append(f"{candidate_time:.2f}s: {error}")
-            if (selected is None and previous_frame is not None and previous_registration is not None
-                    and previous_time is not None):
-                candidate_time = sample_time
+            if abs(sample_time - anchor_time) < .05:
+                frame, registration = anchor_frame, anchor
+            else:
                 try:
                     frame, registration = _propagate_to_time(
-                        capture, previous_time, previous_frame, candidate_time, previous_registration)
-                    selected = (candidate_time, frame, registration)
+                        capture, anchor_time, anchor_frame, sample_time, anchor)
                 except ValueError as error:
-                    errors.append(f"temporal propagation: {error}")
-            if selected is None:
-                raise ValueError("Automatic registration failed near keyframe: " + "; ".join(errors))
-            candidate_time, frame, registration = selected
-            previous_time, previous_frame, previous_registration = candidate_time, frame, registration
+                    raise ValueError(
+                        f"Numbered anchor found at {anchor_time:.2f}s, but line tracking to "
+                        f"{sample_time:.2f}s failed: {error}") from error
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
@@ -349,7 +366,8 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                 "source": "automatic_lines_ocr_v1",
                 "registration_confidence": registration.confidence,
                 "registration_diagnostics": registration.diagnostics,
-                "sample_timestamp_s": candidate_time,
+                "sample_timestamp_s": sample_time,
+                "anchor_timestamp_s": anchor_time,
                 "diagnostic_image": str(output.resolve()),
             })
     finally:

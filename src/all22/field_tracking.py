@@ -45,6 +45,7 @@ def save_calibration_keyframes(db_path: Path, clip_id: str, payload: dict) -> li
                          "registration_confidence": value.get("registration_confidence"),
                          "registration_diagnostics": value.get("registration_diagnostics", {}),
                          "sample_timestamp_s": value.get("sample_timestamp_s"),
+                         "anchor_timestamp_s": value.get("anchor_timestamp_s"),
                          "diagnostic_image": value.get("diagnostic_image")}
             matrix = calibration.matrix / calibration.matrix[2, 2]
             connection.execute(
