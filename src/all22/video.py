@@ -139,7 +139,7 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             histogram_distance = cv2.compareHist(
                 previous_histogram, histogram, cv2.HISTCMP_BHATTACHARYYA
             )
-            camera_cut = histogram_distance >= .72 or raw_score >= 85
+            camera_cut = histogram_distance >= .72
             samples.append(MotionSample(timestamp, 0.0 if camera_cut else raw_score, camera_cut))
             previous = gray
             previous_histogram = histogram
