@@ -224,7 +224,9 @@ def _number_anchored_homography(lines: list[np.ndarray], field_x: np.ndarray,
         distances = []
         for line in lines:
             vector = line[1] - line[0]
-            distances.append(abs(np.cross(vector, point - line[0])) / max(np.linalg.norm(vector), 1e-9))
+            relative = point - line[0]
+            cross = vector[0] * relative[1] - vector[1] * relative[0]
+            distances.append(abs(cross) / max(np.linalg.norm(vector), 1e-9))
         index = int(np.argmin(distances))
         assignments.append((point, float(field_x[index]), float(point @ tangent), number.confidence))
     row_coordinates = np.asarray([item[2] for item in assignments])
