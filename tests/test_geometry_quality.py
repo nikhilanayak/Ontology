@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-from all22.geometry import estimate_homography, project_points
+from all22.geometry import FIELD_WIDTH, estimate_homography, project_points, semantic_correspondences
 from all22.models import PlayStatus
 from all22.quality import evaluate
 from all22.models import Angle, Clip
@@ -14,6 +14,30 @@ def test_homography():
     calibration = estimate_homography(image, field)
     result = project_points(calibration.matrix, [(50, 25)])[0]
     assert np.allclose(result, [15, 5], atol=0.01)
+
+
+def test_two_semantic_yard_lines_create_metric_local_calibration():
+    image, field, metadata = semantic_correspondences([
+        {"kind": "line", "image_points": [[100, 100], [100, 500]]},
+        {"kind": "line", "image_points": [[300, 100], [300, 500]]},
+    ])
+    assert metadata == {"mode": "lines", "absolute_x": False, "line_count": 2}
+    calibration = estimate_homography(image, field)
+    result = project_points(calibration.matrix, [[200, 300]])[0]
+    assert np.allclose(result, [60, FIELD_WIDTH / 2], atol=.05)
+
+
+def test_semantic_field_numbers_infer_rows_and_yard_values():
+    annotations = []
+    for value, x in ((20, 30), (40, 50), (50, 60)):
+        for y in (12, FIELD_WIDTH - 12):
+            annotations.append({"kind": "number", "value": value, "image_point": [x * 10, y * 8]})
+    image, field, metadata = semantic_correspondences(annotations)
+    assert metadata["mode"] == "numbers"
+    calibration = estimate_homography(image, field)
+    projected = project_points(calibration.matrix, [[400, 12 * 8]])[0]
+    assert np.isclose(projected[0], 40, atol=.1)
+    assert any(np.isclose(projected[1], value, atol=.1) for value in (12, FIELD_WIDTH - 12))
 
 
 def test_quality_is_fail_closed():

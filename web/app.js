@@ -22,9 +22,15 @@ function drawOverlay(rows) {
     x.strokeRect(Number(x1),Number(y1),Number(x2-x1),Number(y2-y1));
     x.fillStyle=x.strokeStyle;x.font='16px system-ui';x.fillText(String(r.track_id||''),Number(x1),Math.max(16,Number(y1)-4));
   }
-  for(const [index,point] of (state.calibrationCurrent?.image_points||[]).entries()){
-    x.beginPath();x.fillStyle='#ff4f87';x.arc(point[0],point[1],7,0,Math.PI*2);x.fill();x.fillStyle='white';x.fillText(String(index+1),point[0]+9,point[1]-9);
+  const annotations=state.calibrationCurrent?.annotations||[];
+  for(const [index,annotation] of annotations.entries()){
+    const points=annotation.kind==='line'?annotation.image_points:[annotation.image_point];
+    if(annotation.kind==='line'){x.strokeStyle='#ff4f87';x.lineWidth=3;x.beginPath();x.moveTo(...points[0]);x.lineTo(...points[1]);x.stroke();}
+    for(const point of points){x.beginPath();x.fillStyle='#ff4f87';x.arc(point[0],point[1],7,0,Math.PI*2);x.fill();}
+    x.fillStyle='white';x.fillText(annotation.kind==='number'?String(annotation.value):`L${index+1}`,points[0][0]+9,points[0][1]-9);
   }
+  const pending=state.calibrationCurrent?.pendingLine;
+  if(pending){x.beginPath();x.fillStyle='#ff4f87';x.arc(pending[0],pending[1],7,0,Math.PI*2);x.fill();}
 }
 function draw() {
   field(); const rows=currentRows(), c=$('field'), x=c.getContext('2d');
@@ -40,7 +46,7 @@ function configureTimeline(keys) {
 }
 function updateCalibrationText(){
   $('calibration-json').value=JSON.stringify({keyframes:state.calibrationKeyframes},null,2);
-  $('landmark-count').textContent=`${state.calibrationCurrent?.image_points.length||0} points${state.calibrationCurrent?` at ${state.calibrationCurrent.timestamp_s.toFixed(2)}s`:''}`;
+  $('landmark-count').textContent=`${state.calibrationCurrent?.annotations.length||0} annotations${state.calibrationCurrent?` at ${state.calibrationCurrent.timestamp_s.toFixed(2)}s`:''}`;
 }
 function loadActionForm(){
   const action=state.shotActions[Number($('action-select').value)||0];if(!action)return;
@@ -65,7 +71,7 @@ async function selectShot(shot,button){
   document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button?.classList.add('active');state.shot=shot;state.play=null;state.activeSource=null;state.tracks=[];
   $('play-title').textContent=`${shot.angle} shot`;$('play-detail').textContent=`${shot.clip_id} · ${Number(shot.end_s-shot.start_s).toFixed(1)} seconds`;$('film').src=`/api/video/${state.game}`;
   $('audit').hidden=true;$('timing').hidden=true;$('calibration').hidden=false;$('calibration-status').textContent='';state.calibrationCurrent=null;
-  const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>({timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points}));updateCalibrationText();
+  const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>k.annotations?.length?{timestamp_s:k.timestamp_s,annotations:k.annotations}:{timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points});updateCalibrationText();
   const actions=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/actions`);state.shotActions=actions;$('sources').innerHTML='';
   for(const action of actions){const b=document.createElement('button');b.textContent=`Action ${action.action_order} · ${Number(action.snap_s).toFixed(1)}–${Number(action.dead_s).toFixed(1)}s · ${action.status}`;b.onclick=()=>seekSource({start_s:action.formation_start_s,end_s:action.playback_end_s,snap_s:action.snap_s,play_end_s:action.dead_s},b);$('sources').appendChild(b);}
   $('action-review').hidden=!actions.length;$('action-select').innerHTML=actions.map((a,i)=>`<option value="${i}">Action ${a.action_order} · ${a.status}</option>`).join('');$('action-status').textContent='';loadActionForm();
@@ -105,11 +111,13 @@ $('film').addEventListener('timeupdate',()=>{
 $('audit-save').onclick=async()=>{if(!state.play?.play_id)return;$('audit-status').textContent='Saving…';try{await json(`/api/plays/${state.play.play_id}/audit`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({mapping_correct:$('audit-mapping').checked,sources_correct:$('audit-sources').checked,timing_correct:$('audit-timing').checked,notes:$('audit-notes').value})});await loadPlays();}catch(e){$('audit-status').textContent=e.message;}};
 $('timing-source').onchange=loadTimingSource;
 $('timing-save').onclick=async()=>{const index=Number($('timing-source').value)||0,source=state.play?.sources?.[index];if(!source)return;$('timing-status').textContent='Saving…';try{const result=await json(`/api/clips/${encodeURIComponent(source.clip_id)}/timing`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({snap_s:Number($('timing-snap').value),play_end_s:Number($('timing-end').value)})});source.snap_s=result.snap_s;source.play_end_s=result.play_end_s;$('timing-status').textContent='Saved';}catch(e){$('timing-status').textContent=e.message;}};
-$('landmark-start').onclick=()=>{state.calibrationCurrent={timestamp_s:$('film').currentTime,image_points:[],field_points:[]};$('overlay').classList.add('calibrating');$('film').pause();updateCalibrationText();draw();};
-$('overlay').onclick=e=>{if(!state.calibrationCurrent)return;const rawX=$('landmark-x').value,rawY=$('landmark-y').value,fieldX=Number(rawX),fieldY=Number(rawY);if(rawX===''||rawY===''||!Number.isFinite(fieldX)||!Number.isFinite(fieldY)){ $('calibration-status').textContent='Enter field X and Y before clicking.';return;}const rect=$('overlay').getBoundingClientRect();state.calibrationCurrent.image_points.push([(e.clientX-rect.left)*$('overlay').width/rect.width,(e.clientY-rect.top)*$('overlay').height/rect.height]);state.calibrationCurrent.field_points.push([fieldX,fieldY]);updateCalibrationText();draw();};
-$('landmark-undo').onclick=()=>{state.calibrationCurrent?.image_points.pop();state.calibrationCurrent?.field_points.pop();updateCalibrationText();draw();};
-$('landmark-add').onclick=()=>{if(!state.calibrationCurrent||state.calibrationCurrent.image_points.length<4){$('calibration-status').textContent='A keyframe needs at least four points.';return;}state.calibrationKeyframes.push(state.calibrationCurrent);state.calibrationKeyframes.sort((a,b)=>a.timestamp_s-b.timestamp_s);state.calibrationCurrent=null;$('overlay').classList.remove('calibrating');updateCalibrationText();draw();};
+$('landmark-mode').onchange=()=>{$('landmark-number-label').hidden=$('landmark-mode').value!=='number';};
+$('landmark-start').onclick=()=>{state.calibrationCurrent={timestamp_s:$('film').currentTime,mode:$('landmark-mode').value,annotations:[],pendingLine:null};$('overlay').classList.add('calibrating');$('film').pause();updateCalibrationText();draw();};
+$('overlay').onclick=e=>{if(!state.calibrationCurrent)return;const rect=$('overlay').getBoundingClientRect(),point=[(e.clientX-rect.left)*$('overlay').width/rect.width,(e.clientY-rect.top)*$('overlay').height/rect.height];if(state.calibrationCurrent.mode==='number'){state.calibrationCurrent.annotations.push({kind:'number',value:Number($('landmark-number').value),image_point:point});}else if(state.calibrationCurrent.pendingLine){state.calibrationCurrent.annotations.push({kind:'line',image_points:[state.calibrationCurrent.pendingLine,point]});state.calibrationCurrent.pendingLine=null;}else state.calibrationCurrent.pendingLine=point;updateCalibrationText();draw();};
+$('landmark-undo').onclick=()=>{if(!state.calibrationCurrent)return;if(state.calibrationCurrent.pendingLine)state.calibrationCurrent.pendingLine=null;else state.calibrationCurrent.annotations.pop();updateCalibrationText();draw();};
+$('landmark-add').onclick=()=>{const current=state.calibrationCurrent,minimum=current?.mode==='line'?2:4;if(!current||current.pendingLine||current.annotations.length<minimum){$('calibration-status').textContent=current?.mode==='line'?'Click both sideline intersections on at least two yard lines.':'Click at least four painted numbers across both number rows.';return;}state.calibrationKeyframes.push({timestamp_s:current.timestamp_s,annotations:current.annotations});state.calibrationKeyframes.sort((a,b)=>a.timestamp_s-b.timestamp_s);state.calibrationCurrent=null;$('overlay').classList.remove('calibrating');updateCalibrationText();draw();};
 $('calibration-save').onclick=async()=>{if(!state.shot)return;$('calibration-status').textContent='Saving…';try{const body=JSON.parse($('calibration-json').value);await json(`/api/clips/${encodeURIComponent(state.shot.clip_id)}/calibration`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});$('calibration-status').textContent='Saved; re-run projection and tracking.';}catch(e){$('calibration-status').textContent=e.message;}};
+$('calibration-auto').onclick=async()=>{if(!state.shot)return;$('calibration-auto').disabled=true;$('calibration-status').textContent='Detecting lines, reading numbers, and reconstructing movement…';try{const result=await json(`/api/clips/${encodeURIComponent(state.shot.clip_id)}/auto-calibrate`,{method:'POST'});const actions=result.reconstruction?.actions?.length??0;$('calibration-status').textContent=`Done: ${result.keyframes.length} field keyframes and ${actions} action candidates. Reopen this shot to inspect them.`;}catch(e){$('calibration-status').textContent=e.message;}finally{$('calibration-auto').disabled=false;}};
 $('action-select').onchange=loadActionForm;
 $('action-save').onclick=async()=>{const action=state.shotActions[Number($('action-select').value)||0];if(!action)return;$('action-status').textContent='Saving…';try{const body={formation_start_s:Number($('action-formation').value),snap_s:Number($('action-snap').value),dead_s:Number($('action-dead').value),playback_end_s:Number($('action-end').value)};const result=await json(`/api/actions/${encodeURIComponent(action.action_id)}/timing`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});Object.assign(action,result);$('action-status').textContent='Verified';$('action-select').options[$('action-select').selectedIndex].text=`Action ${action.action_order} · verified`;}catch(e){$('action-status').textContent=e.message;}};
 $('games').onchange=loadWorkspace;$('workspace-mode').onchange=loadWorkspace;

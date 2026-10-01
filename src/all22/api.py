@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import field_tracking
+from . import field_registration, field_tracking, workflow
 from .db import connect, transaction
 
 
@@ -213,6 +213,22 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             item.update(json.loads(item.pop("landmarks_json")))
             values.append(item)
         return {"clip_id": clip_id, "keyframes": values}
+
+    @app.post("/api/clips/{clip_id}/auto-calibrate")
+    def auto_calibrate(clip_id: str):
+        try:
+            values = field_registration.auto_calibrate_clip(
+                db_path, clip_id, db_path.parent / "calibration-diagnostics")
+            with connect(db_path) as connection:
+                artifact = connection.execute(
+                    """SELECT path FROM artifacts WHERE clip_id=? AND kind='clip_detections'
+                       ORDER BY artifact_id DESC LIMIT 1""", (clip_id,),
+                ).fetchone()
+            reconstruction = (workflow.reconstruct_clip(db_path, clip_id, Path(artifact["path"]), db_path.parent)
+                              if artifact and Path(artifact["path"]).exists() else None)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(422, str(error)) from error
+        return {"clip_id": clip_id, "keyframes": values, "reconstruction": reconstruction}
 
     @app.put("/api/actions/{action_id}/timing")
     def save_action_timing(action_id: str, timing: ActionTimingUpdate):

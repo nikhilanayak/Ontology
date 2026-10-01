@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import action_alignment, actions, alignment, bdb, db, field_tracking, nflverse, pfr, pilot, remote_download, supervision, tracking, video, workflow
+from . import action_alignment, actions, alignment, bdb, db, field_registration, field_tracking, nflverse, pfr, pilot, remote_download, supervision, tracking, video, workflow
 from . import pipeline
 
 
@@ -122,6 +122,11 @@ def parser() -> argparse.ArgumentParser:
     calibrate_clip = commands.add_parser("calibrate-clip")
     calibrate_clip.add_argument("--clip-id", required=True)
     calibrate_clip.add_argument("landmarks", type=Path)
+
+    auto_calibrate = commands.add_parser("auto-calibrate-clip")
+    auto_calibrate.add_argument("--clip-id", required=True)
+    auto_calibrate.add_argument("--diagnostics-dir", type=Path,
+                                default=ROOT / "data" / "calibration-diagnostics")
 
     project_clip = commands.add_parser("project-clip")
     project_clip.add_argument("--clip-id", required=True)
@@ -285,6 +290,9 @@ def main() -> None:
         print(json.dumps({"clip_id": args.clip_id,
                           "keyframes": field_tracking.save_calibration_keyframes(args.db, args.clip_id, payload)},
                          indent=2))
+    elif args.command == "auto-calibrate-clip":
+        values = field_registration.auto_calibrate_clip(args.db, args.clip_id, args.diagnostics_dir)
+        print(json.dumps({"clip_id": args.clip_id, "keyframes": values}, indent=2))
     elif args.command == "project-clip":
         result = field_tracking.project_clip(args.db, args.clip_id, args.detections, args.output)
         print(json.dumps({**result, "output": str(args.output)}, indent=2))

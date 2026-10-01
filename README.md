@@ -189,9 +189,25 @@ complete actions. Detection therefore runs before play alignment:
   --game-id bills-at-rams-2022-reg-1 --device cuda --limit 4
 ```
 
-For each shot, add one or more calibration keyframes. Every keyframe contains
-at least four image/field point pairs; multiple keyframes let the homography
-follow a pan or zoom without treating it as a cut:
+Automatic registration is the default. It segments the green field, extracts
+long white segments, merges them into the repeated five-yard-line family,
+reads painted 10/20/30/40/50 numbers, and RANSAC-fits the official NFL field
+template. Three keyframes let the homography follow a pan or zoom without
+treating it as a cut:
+
+```bash
+.venv/bin/pip install -e '.[calibration]'
+.venv/bin/all22 auto-calibrate-clip --clip-id SHOT_ID
+```
+
+Registration fails closed if OCR cannot anchor the otherwise repetitive yard
+lines or if the geometric score is low. The viewer's **Auto-detect field**
+button performs registration, projection, anonymous team assignment,
+field-space tracking, and action discovery in one operation.
+
+Manual semantic annotations remain a correction path. A keyframe can contain
+either painted numbers (enter 10–50 and click their centers on both number
+rows) or yard lines (click each line where it intersects both sidelines):
 
 ```json
 {
@@ -294,11 +310,10 @@ npm run cv:serve
 
 Open `http://127.0.0.1:8000`. The default trajectory workspace lists independent
 camera shots and overlays anonymous boxes on video and player positions on the
-2D field. It also accepts calibration keyframe JSON and exposes discovered
-action windows. The calibration panel can build that JSON by pausing at a
-keyframe, entering a known field coordinate, and clicking the corresponding
-painted landmark in the video. Switch to **Alignment audit** for the earlier
-PBP review queue.
+2D field. It exposes automatic field registration and discovered action
+windows. The manual correction panel uses semantic number/line annotations and
+does not require raw field coordinates. Switch to **Alignment audit** for the
+earlier PBP review queue.
 
 ## Verification
 

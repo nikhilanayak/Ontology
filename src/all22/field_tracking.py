@@ -10,7 +10,7 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
 from .db import connect, transaction
-from .geometry import FIELD_LENGTH, FIELD_WIDTH, estimate_homography, project_points
+from .geometry import FIELD_LENGTH, FIELD_WIDTH, estimate_homography, project_points, semantic_correspondences
 
 
 def save_calibration_keyframes(db_path: Path, clip_id: str, payload: dict) -> list[dict]:
@@ -33,8 +33,18 @@ def save_calibration_keyframes(db_path: Path, clip_id: str, payload: dict) -> li
             timestamp = float(value["timestamp_s"])
             if not float(clip["start_s"]) <= timestamp <= float(clip["end_s"]):
                 raise ValueError(f"Calibration timestamp {timestamp} is outside the camera shot")
-            calibration = estimate_homography(value["image_points"], value["field_points"])
-            landmarks = {"image_points": value["image_points"], "field_points": value["field_points"]}
+            if value.get("annotations"):
+                image_points, field_points, semantic = semantic_correspondences(value["annotations"])
+            else:
+                image_points, field_points = value["image_points"], value["field_points"]
+                semantic = {"mode": "points", "absolute_x": True}
+            calibration = estimate_homography(image_points, field_points)
+            landmarks = {"image_points": image_points, "field_points": field_points,
+                         "annotations": value.get("annotations", []), "semantic": semantic,
+                         "source": value.get("source", "manual"),
+                         "registration_confidence": value.get("registration_confidence"),
+                         "registration_diagnostics": value.get("registration_diagnostics", {}),
+                         "diagnostic_image": value.get("diagnostic_image")}
             matrix = calibration.matrix / calibration.matrix[2, 2]
             connection.execute(
                 """INSERT INTO shot_calibration_keyframes
@@ -46,6 +56,7 @@ def save_calibration_keyframes(db_path: Path, clip_id: str, payload: dict) -> li
                  calibration.p95_error_yards, revision, "verified"),
             )
             stored.append({"timestamp_s": timestamp, "revision": revision,
+                           "semantic": semantic,
                            "inlier_ratio": calibration.inlier_ratio,
                            "median_error_yards": calibration.median_error_yards,
                            "p95_error_yards": calibration.p95_error_yards})
