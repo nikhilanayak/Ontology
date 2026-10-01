@@ -139,7 +139,7 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             histogram_distance = cv2.compareHist(
                 previous_histogram, histogram, cv2.HISTCMP_BHATTACHARYYA
             )
-            camera_cut = histogram_distance >= .42 or raw_score >= 85
+            camera_cut = histogram_distance >= .72 or raw_score >= 85
             samples.append(MotionSample(timestamp, 0.0 if camera_cut else raw_score, camera_cut))
             previous = gray
             previous_histogram = histogram
@@ -180,30 +180,32 @@ def action_windows_from_motion(samples: List[MotionSample], sample_fps: float = 
         while cursor < len(active) and not samples[cursor].camera_cut and smoothed[cursor] >= low_threshold:
             active[cursor] = True
             cursor += 1
-    # Never bridge a real camera cut; bridge short lulls within an action.
-    maximum_gap = max(1, round(sample_fps * 1.4))
+    # Bridge short lulls and one-frame edits within an action. A cut is useful
+    # for suppressing its own discontinuity score, but must not itself become
+    # a hard boundary: pans and zoom jumps occur during many long plays.
+    maximum_gap = max(1, round(sample_fps * 3.0))
     for index in range(1, len(active) - 1):
-        if active[index] or samples[index].camera_cut:
+        if active[index]:
             continue
         left = next((offset for offset in range(1, maximum_gap + 1)
                      if index - offset >= 0 and active[index - offset]), None)
         right = next((offset for offset in range(1, maximum_gap + 1)
                       if index + offset < len(active) and active[index + offset]), None)
-        if left is not None and right is not None and not any(
-                samples[value].camera_cut for value in range(index - left + 1, index + right)):
+        if left is not None and right is not None:
             active[index] = True
     windows: List[ActionWindow] = []
     index = 0
     while index < len(active):
-        if not active[index] or samples[index].camera_cut:
+        if not active[index]:
             index += 1
             continue
         stop = index + 1
-        while stop < len(active) and active[stop] and not samples[stop].camera_cut:
+        while stop < len(active) and active[stop]:
             stop += 1
         duration = samples[stop - 1].timestamp - samples[index].timestamp + 1 / sample_fps
         if minimum_s <= duration <= maximum_s:
-            windows.append(ActionWindow(samples[index].timestamp, samples[stop - 1].timestamp,
+            windows.append(ActionWindow(max(samples[0].timestamp, samples[index].timestamp - .6),
+                                        samples[stop - 1].timestamp + .8,
                                         float(smoothed[index:stop].max())))
         index = stop
     return windows
