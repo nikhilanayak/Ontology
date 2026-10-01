@@ -130,6 +130,31 @@ The importer accepts both snake_case and the camelCase column names used by diff
 .venv/bin/all22 import-bdb path/to/tracking_week_1.csv path/to/tracking_week_2.csv
 ```
 
+For the 2022 Bills-Rams pilot, the archived 2025 dataset supplies the exact
+Next Gen Stats game (`2022090800`).  Link that identifier after importing Week
+1 so nflverse's terminal play IDs join directly to the tracking answers:
+
+```bash
+.venv/bin/all22 set-external-id \
+  --game-id bills-at-rams-2022-reg-1 --provider bdb --external-id 2022090800
+```
+
+Once audited film sources have been reconstructed, compare their anonymous
+field-space tracks with BDB using one-to-one player matching.  The evaluator
+selects among multiple action candidates, searches a bounded snap adjustment,
+checks field-axis orientation, and separately reports the five-yard translation
+needed to resolve repeated-yard-line ambiguity:
+
+```bash
+.venv/bin/all22 evaluate-audited-sources \
+  --game-id bills-at-rams-2022-reg-1 \
+  --output data/bdb-audited-evaluation.json
+```
+
+This is an evaluation and development-time supervision path.  The five-yard
+translation is not treated as an inference-time answer; a production game must
+derive the same constraint from its aligned play-by-play line of scrimmage.
+
 Create a rigidly synchronized supervision pair after verifying the snap timestamp in matching All-22 film:
 
 ```bash
