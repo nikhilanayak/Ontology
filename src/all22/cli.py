@@ -128,6 +128,12 @@ def parser() -> argparse.ArgumentParser:
     auto_calibrate.add_argument("--diagnostics-dir", type=Path,
                                 default=ROOT / "data" / "calibration-diagnostics")
 
+    auto_game = commands.add_parser("auto-reconstruct-game")
+    auto_game.add_argument("--game-id", required=True)
+    auto_game.add_argument("--limit", type=int)
+    auto_game.add_argument("--no-resume", action="store_true")
+    auto_game.add_argument("--output-root", type=Path, default=ROOT / "data")
+
     project_clip = commands.add_parser("project-clip")
     project_clip.add_argument("--clip-id", required=True)
     project_clip.add_argument("--detections", type=Path, required=True)
@@ -293,6 +299,13 @@ def main() -> None:
     elif args.command == "auto-calibrate-clip":
         values = field_registration.auto_calibrate_clip(args.db, args.clip_id, args.diagnostics_dir)
         print(json.dumps({"clip_id": args.clip_id, "keyframes": values}, indent=2))
+    elif args.command == "auto-reconstruct-game":
+        values = field_registration.auto_reconstruct_game(
+            args.db, args.game_id, args.output_root, args.limit, not args.no_resume)
+        print(json.dumps({"game_id": args.game_id, "results": values,
+                          "created": sum(item["status"] == "created" for item in values),
+                          "failed": sum(item["status"] == "failed" for item in values),
+                          "cached": sum(item["status"] == "cached" for item in values)}, indent=2))
     elif args.command == "project-clip":
         result = field_tracking.project_clip(args.db, args.clip_id, args.detections, args.output)
         print(json.dumps({**result, "output": str(args.output)}, indent=2))

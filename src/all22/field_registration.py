@@ -380,3 +380,46 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
     finally:
         capture.release()
     return save_calibration_keyframes(db_path, clip_id, payload)
+
+
+def auto_reconstruct_game(db_path: Path, game_id: str, output_root: Path,
+                          limit: Optional[int] = None, resume: bool = True) -> list[dict]:
+    """Register and reconstruct every already-detected shot, reusing one OCR model."""
+    from .db import connect
+    from .workflow import reconstruct_clip
+
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be positive")
+    try:
+        import easyocr
+        import torch
+    except ImportError as error:
+        raise RuntimeError("Automatic calibration requires `pip install -e '.[calibration]'`") from error
+    with connect(db_path) as connection:
+        rows = connection.execute(
+            """SELECT c.clip_id,
+                      (SELECT path FROM artifacts a WHERE a.clip_id=c.clip_id AND a.kind='clip_detections'
+                       ORDER BY artifact_id DESC LIMIT 1) AS detections,
+                      EXISTS(SELECT 1 FROM artifacts a WHERE a.clip_id=c.clip_id AND a.kind='clip_tracks') tracked
+               FROM clips c WHERE c.game_id=? AND EXISTS(
+                 SELECT 1 FROM artifacts a WHERE a.clip_id=c.clip_id AND a.kind='clip_detections')
+               ORDER BY c.start_s""", (game_id,),
+        ).fetchall()
+    selected = list(rows[:limit] if limit is not None else rows)
+    reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available(), verbose=False)
+    results = []
+    for row in selected:
+        clip_id = row["clip_id"]
+        if resume and bool(row["tracked"]):
+            results.append({"clip_id": clip_id, "status": "cached"})
+            continue
+        try:
+            keyframes = auto_calibrate_clip(
+                db_path, clip_id, output_root / "calibration-diagnostics", reader=reader)
+            reconstruction = reconstruct_clip(
+                db_path, clip_id, Path(row["detections"]), output_root)
+            results.append({"clip_id": clip_id, "status": "created",
+                            "keyframes": len(keyframes), "reconstruction": reconstruction})
+        except (ValueError, RuntimeError) as error:
+            results.append({"clip_id": clip_id, "status": "failed", "error": str(error)})
+    return results
