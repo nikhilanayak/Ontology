@@ -344,19 +344,26 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                 f"{item.get('lines', 0)} lines/conf {item.get('confidence', 0):.2f}"
                 for item in attempts)
             raise ValueError(f"No absolute numbered-field anchor found after scanning the shot: {summary}")
-        _, anchor_time, anchor_frame, anchor = max(anchors, key=lambda item: item[0])
-
         for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
-            if abs(sample_time - anchor_time) < .05:
-                frame, registration = anchor_frame, anchor
-            else:
+            propagation_errors = []
+            selected = None
+            for _, anchor_time, anchor_frame, anchor in sorted(
+                    anchors, key=lambda item: (abs(item[1] - sample_time), -item[0])):
                 try:
-                    frame, registration = _propagate_to_time(
-                        capture, anchor_time, anchor_frame, sample_time, anchor)
+                    if abs(sample_time - anchor_time) < .05:
+                        frame, registration = anchor_frame, anchor
+                    else:
+                        frame, registration = _propagate_to_time(
+                            capture, anchor_time, anchor_frame, sample_time, anchor)
+                    selected = (anchor_time, frame, registration)
+                    break
                 except ValueError as error:
-                    raise ValueError(
-                        f"Numbered anchor found at {anchor_time:.2f}s, but line tracking to "
-                        f"{sample_time:.2f}s failed: {error}") from error
+                    propagation_errors.append(f"{anchor_time:.2f}s: {error}")
+            if selected is None:
+                raise ValueError(
+                    f"Numbered anchors were found, but none tracked to {sample_time:.2f}s: "
+                    + "; ".join(propagation_errors))
+            anchor_time, frame, registration = selected
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
