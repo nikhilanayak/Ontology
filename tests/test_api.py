@@ -71,3 +71,11 @@ def test_game_and_static_endpoints(tmp_path: Path):
     })
     assert response.status_code == 200
     assert client.get("/api/clips/c1/actions").json()[0]["status"] == "verified"
+    response = client.put("/api/clips/c1/calibration", json={"keyframes": [{
+        "timestamp_s": 12,
+        "image_points": [[0, 0], [100, 0], [0, 100], [100, 100]],
+        "field_points": [[10, 0], [20, 0], [10, 20], [20, 20]],
+    }]})
+    assert response.status_code == 200
+    calibration = client.get("/api/clips/c1/calibration").json()
+    assert calibration["keyframes"][0]["field_points"][1] == [20, 0]

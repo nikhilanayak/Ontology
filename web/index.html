@@ -22,7 +22,11 @@
       <div id="sources" class="sources"></div>
       <fieldset id="calibration" hidden>
         <legend>Shot calibration</legend>
-        <p>Paste timestamped image↔field landmark sets (pixels to yards).</p>
+        <p>Pause the video, enter the field coordinate in yards, then click that landmark in the image. Add at least four non-collinear points per keyframe.</p>
+        <label>Field X<input id="landmark-x" type="number" min="0" max="120" step="0.1"></label>
+        <label>Field Y<input id="landmark-y" type="number" min="0" max="53.333" step="0.1"></label>
+        <button id="landmark-start">Start keyframe</button><button id="landmark-undo">Undo point</button><button id="landmark-add">Add keyframe</button>
+        <span id="landmark-count">0 points</span>
         <textarea id="calibration-json" rows="5" placeholder='{"keyframes":[{"timestamp_s":12.0,"image_points":[...],"field_points":[...]}]}'></textarea>
         <button id="calibration-save">Save calibration</button><span id="calibration-status"></span>
       </fieldset>

@@ -15,6 +15,10 @@
   background: transparent;
   pointer-events: none;
 }
+.video-stage #overlay.calibrating {
+  pointer-events: auto;
+  cursor: crosshair;
+}
 textarea {
   width: 100%;
   flex-basis: 100%;

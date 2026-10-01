@@ -295,7 +295,10 @@ npm run cv:serve
 Open `http://127.0.0.1:8000`. The default trajectory workspace lists independent
 camera shots and overlays anonymous boxes on video and player positions on the
 2D field. It also accepts calibration keyframe JSON and exposes discovered
-action windows. Switch to **Alignment audit** for the earlier PBP review queue.
+action windows. The calibration panel can build that JSON by pausing at a
+keyframe, entering a known field coordinate, and clicking the corresponding
+painted landmark in the video. Switch to **Alignment audit** for the earlier
+PBP review queue.
 
 ## Verification
 

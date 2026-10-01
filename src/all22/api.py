@@ -199,6 +199,21 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             raise HTTPException(422, str(error)) from error
         return {"clip_id": clip_id, "keyframes": values}
 
+    @app.get("/api/clips/{clip_id}/calibration")
+    def calibration(clip_id: str):
+        with connect(db_path) as connection:
+            rows = connection.execute(
+                """SELECT timestamp_s,landmarks_json,inlier_ratio,median_error_yards,p95_error_yards,
+                          revision,status FROM shot_calibration_keyframes WHERE clip_id=? ORDER BY timestamp_s""",
+                (clip_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item.update(json.loads(item.pop("landmarks_json")))
+            values.append(item)
+        return {"clip_id": clip_id, "keyframes": values}
+
     @app.put("/api/actions/{action_id}/timing")
     def save_action_timing(action_id: str, timing: ActionTimingUpdate):
         with transaction(db_path) as connection:
