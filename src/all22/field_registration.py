@@ -8,7 +8,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .geometry import FIELD_WIDTH, estimate_homography
+from .geometry import FIELD_WIDTH, estimate_homography, project_points
 
 
 @dataclass(frozen=True)
@@ -205,6 +205,75 @@ def _assign_field_x(lines: list[np.ndarray], numbers: list[OCRNumber]) -> tuple[
     return restored, bool(best[0] < 2.0), float(best[0])
 
 
+def _number_anchored_homography(lines: list[np.ndarray], field_x: np.ndarray,
+                                numbers: list[OCRNumber], frame_shape: tuple[int, ...],
+                                ) -> tuple[Optional[np.ndarray], dict]:
+    """Solve line-x and painted-number-y constraints without fake sidelines."""
+    if len(numbers) < 3:
+        return None, {"semantic_number_fit": False, "semantic_reason": "fewer_than_three_numbers"}
+    height, width = frame_shape[:2]
+    tangent = lines[0][1] - lines[0][0]
+    tangent /= max(np.linalg.norm(tangent), 1e-9)
+    if ((abs(tangent[1]) >= abs(tangent[0]) and tangent[1] < 0) or
+            (abs(tangent[0]) > abs(tangent[1]) and tangent[0] < 0)):
+        tangent *= -1
+
+    assignments = []
+    for number in numbers:
+        point = np.asarray(number.center, float)
+        distances = []
+        for line in lines:
+            vector = line[1] - line[0]
+            distances.append(abs(np.cross(vector, point - line[0])) / max(np.linalg.norm(vector), 1e-9))
+        index = int(np.argmin(distances))
+        assignments.append((point, float(field_x[index]), float(point @ tangent), number.confidence))
+    row_coordinates = np.asarray([item[2] for item in assignments])
+    order = np.argsort(row_coordinates)
+    gaps = np.diff(row_coordinates[order])
+    if not len(gaps) or float(np.max(gaps)) < .08 * min(height, width):
+        return None, {"semantic_number_fit": False, "semantic_reason": "number_rows_not_separated"}
+    split = int(np.argmax(gaps)) + 1
+    low = set(order[:split].tolist())
+    if not low or len(low) == len(assignments):
+        return None, {"semantic_number_fit": False, "semantic_reason": "number_row_split_failed"}
+
+    # Solve H from image to field with h22 fixed to one. Yard lines constrain
+    # field x for every point on the line; number centers additionally constrain
+    # their official cross-field row. Coordinates are normalized for stability.
+    rows, targets = [], []
+    for line, x in zip(lines, field_x):
+        for point in np.linspace(line[0], line[1], 5):
+            u, v = point[0] / width, point[1] / height
+            rows.append([u, v, 1, 0, 0, 0, -x * u, -x * v]); targets.append(x)
+    for index, (point, x, _, confidence) in enumerate(assignments):
+        u, v = point[0] / width, point[1] / height
+        y = 12.0 if index in low else FIELD_WIDTH - 12.0
+        weight = 2.0 * max(.55, confidence)
+        rows.append((weight * np.asarray([u, v, 1, 0, 0, 0, -x * u, -x * v])).tolist())
+        targets.append(weight * x)
+        rows.append((weight * np.asarray([0, 0, 0, u, v, 1, -y * u, -y * v])).tolist())
+        targets.append(weight * y)
+    design = np.asarray(rows, float)
+    if np.linalg.matrix_rank(design) < 8:
+        return None, {"semantic_number_fit": False, "semantic_reason": "rank_deficient"}
+    parameters, _, _, singular = np.linalg.lstsq(design, np.asarray(targets), rcond=None)
+    normalized = np.r_[parameters, 1.0].reshape(3, 3)
+    matrix = normalized @ np.diag([1 / width, 1 / height, 1.0])
+    projected = project_points(matrix, [item[0] for item in assignments])
+    expected = np.asarray([[item[1], 12.0 if index in low else FIELD_WIDTH - 12.0]
+                           for index, item in enumerate(assignments)])
+    errors = np.linalg.norm(projected - expected, axis=1)
+    condition = float(singular[0] / max(singular[-1], 1e-12))
+    valid = (np.isfinite(matrix).all() and condition < 1e7 and
+             float(np.median(errors)) <= 2.0 and float(np.percentile(errors, 90)) <= 4.0)
+    return (matrix if valid else None), {
+        "semantic_number_fit": valid, "semantic_condition": condition,
+        "semantic_median_error_yards": float(np.median(errors)),
+        "semantic_p90_error_yards": float(np.percentile(errors, 90)),
+        "semantic_number_rows": [len(low), len(assignments) - len(low)],
+    }
+
+
 def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNumber]] = None) -> Registration:
     lines, mask, white = detect_yard_lines(frame)
     raw_recognized = numbers if numbers is not None else read_field_numbers(frame, reader)
@@ -217,6 +286,13 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
         image_points.extend(point.tolist() for point in endpoints)
         field_points.extend([[float(x), 0.0], [float(x), FIELD_WIDTH]])
     calibration = estimate_homography(image_points, field_points)
+    semantic_matrix, semantic_diagnostics = _number_anchored_homography(
+        lines, field_x, recognized, frame.shape)
+    if semantic_matrix is not None:
+        # Preserve point-pair storage compatibility while retaining the
+        # semantically constrained matrix during temporal propagation.
+        field_points = project_points(semantic_matrix, image_points).tolist()
+        calibration = estimate_homography(image_points, field_points)
     centers = np.asarray([line.mean(axis=0) for line in lines])
     if len(centers) > 2:
         axis = centers[-1] - centers[0];axis /= max(np.linalg.norm(axis), 1e-9)
@@ -240,6 +316,7 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
                    "median_error_yards": calibration.median_error_yards,
                    "p95_error_yards": calibration.p95_error_yards,
                    "inlier_p95_error_yards": calibration.inlier_p95_error_yards}
+    diagnostics.update(semantic_diagnostics)
     return Registration(image_points, field_points, calibration.matrix, confidence, absolute, diagnostics)
 
 
