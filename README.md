@@ -214,6 +214,19 @@ least four non-collinear image/field correspondences, in yards on the standard
   --output data/reports/buf-lar.json
 ```
 
+For BDB 2026, mark the pass-release time in the independent source and anchor
+it to that play's maximum input `frame_id`:
+
+```bash
+.venv/bin/all22 project-source \
+  --play-id lions-at-chiefs-2023-reg-1:PLAY --source-order 0 \
+  --video-anchor-s PASS_RELEASE_VIDEO_SECONDS \
+  --bdb-anchor-frame MAX_INPUT_FRAME \
+  --detections data/detections/PLAY-sideline.parquet \
+  --landmarks data/landmarks/PLAY-sideline.json \
+  --output data/projected/PLAY-sideline.parquet
+```
+
 The evaluator snap-aligns results to BDB, performs anonymous Hungarian
 matching, and reports median/p90 position error and player-frame coverage. The
 expansion target is median error at most 2 yards, p90 at most 5 yards, and at

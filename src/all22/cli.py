@@ -99,6 +99,8 @@ def parser() -> argparse.ArgumentParser:
     project.add_argument("--detections", type=Path, required=True)
     project.add_argument("--landmarks", type=Path, required=True)
     project.add_argument("--output", type=Path, required=True)
+    project.add_argument("--video-anchor-s", type=float)
+    project.add_argument("--bdb-anchor-frame", type=int)
 
     fuse = commands.add_parser("fuse-sources")
     fuse.add_argument("--output", type=Path, required=True)
@@ -208,7 +210,8 @@ def main() -> None:
         print(json.dumps({"rows": rows, "output": str(args.output)}))
     elif args.command == "project-source":
         result = tracking.project_source(args.db, args.play_id, args.source_order,
-                                         args.detections, args.landmarks, args.output)
+                                         args.detections, args.landmarks, args.output,
+                                         args.video_anchor_s, args.bdb_anchor_frame)
         print(json.dumps({**result, "output": str(args.output)}, indent=2))
     elif args.command == "fuse-sources":
         rows = tracking.fuse_sources(args.inputs, args.output)

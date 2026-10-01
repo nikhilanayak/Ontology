@@ -151,27 +151,34 @@ def detect_source(db_path: Path, play_id: str, source_order: int, output: Path,
 
 
 def project_source(db_path: Path, play_id: str, source_order: int, detections: Path,
-                   landmarks: Path, output: Path) -> dict:
+                   landmarks: Path, output: Path, video_anchor_s: Optional[float] = None,
+                   bdb_anchor_frame: Optional[int] = None) -> dict:
     source = _source_record(db_path, play_id, source_order)
-    if source["snap_s"] is None:
-        raise ValueError("Source requires an audited snap timestamp before projection")
+    if (video_anchor_s is None) != (bdb_anchor_frame is None):
+        raise ValueError("video_anchor_s and bdb_anchor_frame must be provided together")
+    if video_anchor_s is None and source["snap_s"] is None:
+        raise ValueError("Source requires an audited snap timestamp or an explicit synchronization anchor")
     calibration_input = json.loads(landmarks.read_text(encoding="utf-8"))
     calibration = estimate_homography(calibration_input["image_points"], calibration_input["field_points"])
     frame = pd.read_parquet(detections)
     points = project_points(calibration.matrix, frame[["image_x", "image_y"]].itertuples(index=False, name=None))
     frame["x"] = points[:, 0]
     frame["y"] = points[:, 1]
-    frame["t"] = frame.video_timestamp.astype(float) - float(source["snap_s"])
-    # BDB tracking is sampled at 10 Hz. This is a normalized snap-relative frame;
-    # evaluation shifts it to the source BDB snap frame.
+    anchor_s = float(video_anchor_s if video_anchor_s is not None else source["snap_s"])
+    frame["t"] = frame.video_timestamp.astype(float) - anchor_s
     frame["relative_frame"] = np.rint(frame.t * 10).astype(int)
+    if bdb_anchor_frame is not None:
+        # BDB 2026 input sequences end immediately before the pass. Manually
+        # mark pass release in each film source and anchor it to max(frame_id).
+        frame["frame_id"] = frame.relative_frame + int(bdb_anchor_frame)
     frame["calibration_inlier_ratio"] = calibration.inlier_ratio
     frame["calibration_median_error_yards"] = calibration.median_error_yards
     frame["calibration_p95_error_yards"] = calibration.p95_error_yards
     frame = frame[(frame.x.between(0, 120)) & (frame.y.between(0, 160 / 3))]
     output.parent.mkdir(parents=True, exist_ok=True)
     frame.to_parquet(output, index=False)
-    return {"rows": len(frame), "inlier_ratio": calibration.inlier_ratio,
+    return {"rows": len(frame), "anchor_video_s": anchor_s,
+            "anchor_bdb_frame": bdb_anchor_frame, "inlier_ratio": calibration.inlier_ratio,
             "median_error_yards": calibration.median_error_yards,
             "p95_error_yards": calibration.p95_error_yards}
 
