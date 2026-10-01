@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+# Keep high-churn caches and temporary files on the NVMe-backed project disk.
+# Override ONTOLOGY_RUNTIME_ROOT only when deploying to another fast volume.
+ONTOLOGY_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export ONTOLOGY_PROJECT_ROOT
+export ONTOLOGY_RUNTIME_ROOT="${ONTOLOGY_RUNTIME_ROOT:-$ONTOLOGY_PROJECT_ROOT/.runtime}"
+
+export XDG_CACHE_HOME="$ONTOLOGY_RUNTIME_ROOT/xdg-cache"
+export PIP_CACHE_DIR="$ONTOLOGY_RUNTIME_ROOT/pip-cache"
+export NPM_CONFIG_CACHE="$ONTOLOGY_RUNTIME_ROOT/npm-cache"
+export PYTHONPYCACHEPREFIX="$ONTOLOGY_RUNTIME_ROOT/python-cache"
+export HF_HOME="$ONTOLOGY_RUNTIME_ROOT/huggingface"
+export HF_DATASETS_CACHE="$ONTOLOGY_RUNTIME_ROOT/huggingface/datasets"
+export TORCH_HOME="$ONTOLOGY_RUNTIME_ROOT/torch"
+export TRITON_CACHE_DIR="$ONTOLOGY_RUNTIME_ROOT/triton"
+export CUDA_CACHE_PATH="$ONTOLOGY_RUNTIME_ROOT/cuda"
+export NUMBA_CACHE_DIR="$ONTOLOGY_RUNTIME_ROOT/numba"
+export MPLCONFIGDIR="$ONTOLOGY_RUNTIME_ROOT/matplotlib"
+export TMPDIR="$ONTOLOGY_RUNTIME_ROOT/tmp"
+
+mkdir -p \
+  "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" "$NPM_CONFIG_CACHE" \
+  "$PYTHONPYCACHEPREFIX" "$HF_HOME" "$HF_DATASETS_CACHE" \
+  "$TORCH_HOME" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" \
+  "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR" "$TMPDIR" \
+  "$ONTOLOGY_PROJECT_ROOT/data" "$ONTOLOGY_PROJECT_ROOT/downloads"

@@ -13,14 +13,24 @@ Clone and bootstrap the code on the host:
 ```bash
 ssh -p "$ONTOLOGY_PORT" "$ONTOLOGY_HOST"
 git clone https://github.com/nikhilanayak/Ontology.git ~/Ontology
-cd ~/Ontology
+cd ~/fast/Ontology
 ./scripts/bootstrap-production.sh
 ```
+
+Load the fast-disk cache environment before running commands directly:
+
+```bash
+cd ~/fast/Ontology
+source scripts/production-env.sh
+```
+
+This routes pip, npm, Python bytecode, Hugging Face, Torch, Triton, CUDA,
+Numba, Matplotlib, and temporary caches into `.runtime/` on the project disk.
 
 Run the CPU test suite:
 
 ```bash
-cd ~/Ontology
+cd ~/fast/Ontology
 .venv/bin/python -m pytest -q
 ```
 
