@@ -340,8 +340,20 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     result["track_reliable"] = result.track_coverage >= .35
     reliable = result[result.track_reliable]
     burst_times = result.loc[result.crowd_burst, "video_timestamp"]
-    roster_pool = (reliable[reliable.video_timestamp < float(burst_times.min())]
-                   if len(burst_times) else reliable)
+    with connect(db_path) as connection:
+        action = connection.execute(
+            "SELECT snap_s FROM action_windows WHERE clip_id=? AND snap_s IS NOT NULL "
+            "ORDER BY (status='verified') DESC, confidence DESC LIMIT 1", (clip_id,),
+        ).fetchone()
+    roster_pool = reliable
+    if action and len(reliable):
+        distance = (reliable.video_timestamp - float(action["snap_s"])).abs()
+        snap_rows = reliable[distance <= float(distance.min()) + .02]
+        snap_ids = set(snap_rows.track_id)
+        if len(snap_ids) >= 12:
+            roster_pool = reliable[reliable.track_id.isin(snap_ids)]
+    elif len(burst_times):
+        roster_pool = reliable[reliable.video_timestamp < float(burst_times.min())]
     roster_scores = roster_pool.groupby("track_id").agg(
         observations=("track_id", "size"),
         mean_confidence=("confidence", "mean") if "confidence" in reliable else ("track_id", "size"),
