@@ -53,6 +53,13 @@ def parser() -> argparse.ArgumentParser:
     cuts.add_argument("--sample-fps", type=float, default=2.0)
     cuts.add_argument("video", type=Path)
 
+    actions = commands.add_parser("scan-actions")
+    actions.add_argument("--sample-fps", type=float, default=5.0)
+    actions.add_argument("--start-s", type=float, default=0.0)
+    actions.add_argument("--end-s", type=float)
+    actions.add_argument("--output", type=Path)
+    actions.add_argument("video", type=Path)
+
     segment = commands.add_parser("segment-game")
     segment.add_argument("--game-id", required=True)
     segment.add_argument("--sample-fps", type=float, default=4.0)
@@ -172,6 +179,16 @@ def main() -> None:
         print(json.dumps({"video": str(args.video), "cuts": cuts,
                           "clips": [clip.__dict__ for clip in video.clips_from_cuts(args.game_id, info.duration, cuts)]},
                          default=str))
+    elif args.command == "scan-actions":
+        samples = video.camera_compensated_motion(args.video, args.sample_fps, args.start_s, args.end_s)
+        windows = video.action_windows_from_motion(samples, args.sample_fps)
+        payload = {"video": str(args.video), "samples": [item.__dict__ for item in samples],
+                   "windows": [item.__dict__ for item in windows]}
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        print(json.dumps({"samples": len(samples), "camera_cuts": sum(item.camera_cut for item in samples),
+                          "windows": [item.__dict__ for item in windows]}, indent=2))
     elif args.command == "segment-game":
         clips = pipeline.segment_game(args.db, args.game_id, args.sample_fps, args.scene_threshold)
         print(json.dumps({"clips": len(clips), "sideline": sum(c.angle.value == "sideline" for c in clips),
