@@ -170,56 +170,119 @@ class FieldTrack:
     appearance: np.ndarray
     timestamp: float
     missed: int = 0
+    hits: int = 1
+    confidence: float = 1.0
 
 
 class FieldSpaceTracker:
-    def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0):
+    """Associate detections after camera motion has been removed by field projection.
+
+    The two association passes follow the useful part of ByteTrack's design:
+    confident detections establish the assignment and weaker detections may only
+    recover tracks that remain unmatched.  This prevents a weak duplicate from
+    stealing an established identity while still bridging brief detector misses.
+    """
+
+    appearance_columns = ("lab_l", "lab_a", "lab_b", "hsv_h", "hsv_s", "hsv_v")
+    appearance_scale = np.asarray([50, 30, 30, 45, 60, 60], dtype=float)
+
+    def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
+                 high_confidence: float = .55, low_confidence: float = .15):
         self.maximum_missed = maximum_missed
         self.maximum_speed_yps = maximum_speed_yps
+        self.high_confidence = high_confidence
+        self.low_confidence = low_confidence
         self.active: list[FieldTrack] = []
         self.next_id = 1
+
+    def _appearance(self, detections: pd.DataFrame) -> np.ndarray:
+        values = np.full((len(detections), len(self.appearance_columns)), np.nan, dtype=float)
+        for column_index, column in enumerate(self.appearance_columns):
+            if column in detections:
+                values[:, column_index] = pd.to_numeric(detections[column], errors="coerce")
+        defaults = np.asarray([128, 128, 128, 90, 80, 128], dtype=float)
+        return np.where(np.isfinite(values), values, defaults)
+
+    def _associate(self, track_indices: list[int], detection_indices: list[int],
+                   positions: np.ndarray, appearances: np.ndarray, teams: list[str],
+                   confidences: np.ndarray, timestamp: float,
+                   assigned: list[int]) -> set[int]:
+        if not track_indices or not detection_indices:
+            return set()
+        costs = np.full((len(track_indices), len(detection_indices)), 1e6, dtype=float)
+        for cost_row, track_index in enumerate(track_indices):
+            track = self.active[track_index]
+            elapsed = max(timestamp - track.timestamp, 1e-3)
+            predicted = track.position + track.velocity * elapsed
+            # Allow modest registration noise as well as physically plausible motion.
+            maximum_distance = self.maximum_speed_yps * elapsed + 1.5 + .15 * track.missed
+            for cost_column, detection_index in enumerate(detection_indices):
+                distance = float(np.linalg.norm(predicted - positions[detection_index]))
+                if distance > maximum_distance:
+                    continue
+                candidate_team = teams[detection_index]
+                team_penalty = (3.0 if track.team != "unknown" and candidate_team != "unknown"
+                                and track.team != candidate_team else 0.0)
+                appearance = float(np.linalg.norm(
+                    (track.appearance - appearances[detection_index]) / self.appearance_scale))
+                confidence_penalty = .5 * (1 - confidences[detection_index])
+                costs[cost_row, cost_column] = distance + .8 * appearance + team_penalty + confidence_penalty
+        rows, columns = linear_sum_assignment(costs)
+        matched_tracks = set()
+        for cost_row, cost_column in zip(rows, columns):
+            if costs[cost_row, cost_column] >= 1e5:
+                continue
+            track_index = track_indices[cost_row]
+            detection_index = detection_indices[cost_column]
+            track = self.active[track_index]
+            elapsed = max(timestamp - track.timestamp, 1e-3)
+            measured_velocity = (positions[detection_index] - track.position) / elapsed
+            track.velocity = .7 * track.velocity + .3 * measured_velocity
+            track.position = positions[detection_index]
+            track.appearance = .85 * track.appearance + .15 * appearances[detection_index]
+            if track.team == "unknown" and teams[detection_index] != "unknown":
+                track.team = teams[detection_index]
+            track.timestamp = timestamp
+            track.missed = 0
+            track.hits += 1
+            track.confidence = .8 * track.confidence + .2 * confidences[detection_index]
+            assigned[detection_index] = track.track_id
+            matched_tracks.add(track_index)
+        return matched_tracks
 
     def update(self, detections: pd.DataFrame, timestamp: float) -> list[int]:
         assigned = [-1] * len(detections)
         positions = detections[["field_x", "field_y"]].to_numpy(float)
-        appearances = detections[["lab_a", "lab_b"]].fillna(128).to_numpy(float)
+        appearances = self._appearance(detections)
         teams = detections.team.astype(str).tolist()
+        confidences = (pd.to_numeric(detections["confidence"], errors="coerce").fillna(1).to_numpy(float)
+                       if "confidence" in detections else np.ones(len(detections), dtype=float))
+        confidences = np.clip(confidences, 0, 1)
         if self.active and len(detections):
-            costs = np.full((len(self.active), len(detections)), 1e6, dtype=float)
-            for row, track in enumerate(self.active):
-                elapsed = max(timestamp - track.timestamp, 1e-3)
-                predicted = track.position + track.velocity * elapsed
-                for column, position in enumerate(positions):
-                    distance = float(np.linalg.norm(predicted - position))
-                    if distance > self.maximum_speed_yps * elapsed + 1.5:
-                        continue
-                    team_penalty = 0 if track.team == "unknown" or teams[column] == "unknown" or track.team == teams[column] else 8
-                    appearance = float(np.linalg.norm(track.appearance - appearances[column])) / 25
-                    costs[row, column] = distance + appearance + team_penalty
-            rows, columns = linear_sum_assignment(costs)
-            for row, column in zip(rows, columns):
-                if costs[row, column] >= 1e5:
-                    continue
-                track = self.active[row]
-                elapsed = max(timestamp - track.timestamp, 1e-3)
-                measured_velocity = (positions[column] - track.position) / elapsed
-                track.velocity = .6 * track.velocity + .4 * measured_velocity
-                track.position = positions[column]
-                track.appearance = .8 * track.appearance + .2 * appearances[column]
-                if track.team == "unknown" and teams[column] != "unknown":
-                    track.team = teams[column]
-                track.timestamp = timestamp
-                track.missed = 0
-                assigned[column] = track.track_id
-        matched = set(assigned)
-        for track in self.active:
-            if track.track_id not in matched:
+            all_tracks = list(range(len(self.active)))
+            high = np.flatnonzero(confidences >= self.high_confidence).tolist()
+            matched_tracks = self._associate(
+                all_tracks, high, positions, appearances, teams, confidences, timestamp, assigned)
+            remaining_tracks = [index for index in all_tracks if index not in matched_tracks]
+            low = np.flatnonzero((confidences >= self.low_confidence)
+                                 & (confidences < self.high_confidence)).tolist()
+            matched_tracks |= self._associate(
+                remaining_tracks, low, positions, appearances, teams, confidences, timestamp, assigned)
+        else:
+            matched_tracks = set()
+        for track_index, track in enumerate(self.active):
+            if track_index not in matched_tracks:
                 track.missed += 1
         self.active = [track for track in self.active if track.missed <= self.maximum_missed]
         for index, position in enumerate(positions):
             if assigned[index] >= 0:
                 continue
-            track = FieldTrack(self.next_id, position, np.zeros(2), teams[index], appearances[index], timestamp)
+            # Very weak detections may recover an existing track but do not create
+            # new identities of their own.
+            if confidences[index] < self.high_confidence:
+                continue
+            track = FieldTrack(self.next_id, position, np.zeros(2), teams[index], appearances[index],
+                               timestamp, confidence=float(confidences[index]))
             self.active.append(track)
             assigned[index] = self.next_id
             self.next_id += 1
@@ -236,6 +299,10 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     for timestamp, group in frame.groupby("video_timestamp", sort=True):
         value = group.copy()
         ids = tracker.update(value, float(timestamp))
+        value = value.loc[[item >= 0 for item in ids]].copy()
+        ids = [item for item in ids if item >= 0]
+        if value.empty:
+            continue
         value["track_id"] = [f"{clip_id}:t{item}" for item in ids]
         active = {track.track_id: track for track in tracker.active}
         value["vx"] = [float(active[item].velocity[0]) for item in ids]

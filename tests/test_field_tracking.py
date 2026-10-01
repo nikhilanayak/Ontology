@@ -3,7 +3,12 @@ from pathlib import Path
 import pandas as pd
 
 from all22.db import initialize, transaction
-from all22.field_tracking import project_clip, save_calibration_keyframes, track_projected_clip
+from all22.field_tracking import (
+    FieldSpaceTracker,
+    project_clip,
+    save_calibration_keyframes,
+    track_projected_clip,
+)
 
 
 def prepared_db(tmp_path: Path) -> tuple[Path, str]:
@@ -62,3 +67,29 @@ def test_projection_marks_extrapolated_frames_invalid(tmp_path: Path):
     output = tmp_path / "projected.parquet"
     project_clip(database, clip_id, path, output)
     assert not bool(pd.read_parquet(output).iloc[0].calibration_valid)
+
+
+def test_tracker_gives_confident_detection_first_claim():
+    tracker = FieldSpaceTracker()
+    columns = {"field_y": [20.0], "lab_l": [100], "lab_a": [100], "lab_b": [100],
+               "hsv_h": [40], "hsv_s": [80], "hsv_v": [100], "team": ["team_0"]}
+    first = pd.DataFrame({"field_x": [10.0], "confidence": [.9], **columns})
+    assert tracker.update(first, 0.0) == [1]
+    # A weak duplicate is geometrically closer, but it must not steal the track.
+    second = pd.DataFrame({
+        "field_x": [10.4, 10.1], "field_y": [20.0, 20.0], "confidence": [.9, .3],
+        "lab_l": [100, 100], "lab_a": [100, 100], "lab_b": [100, 100],
+        "hsv_h": [40, 40], "hsv_s": [80, 80], "hsv_v": [100, 100],
+        "team": ["team_0", "team_0"],
+    })
+    assert tracker.update(second, .1) == [1, -1]
+
+
+def test_tracker_uses_velocity_across_brief_miss():
+    tracker = FieldSpaceTracker(maximum_missed=3)
+    def detection(x):
+        return pd.DataFrame({"field_x": [x], "field_y": [20.0], "confidence": [.9],
+                             "lab_a": [100], "lab_b": [100], "team": ["team_0"]})
+    assert tracker.update(detection(10), 0.0) == [1]
+    assert tracker.update(detection(11), .1) == [1]
+    assert tracker.update(detection(13), .3) == [1]
