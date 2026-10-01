@@ -61,18 +61,6 @@ def test_people_outside_field_region_are_filtered():
     assert scores.tolist() == [.9]
 
 
-def test_people_beyond_painted_sidelines_are_filtered():
-    frame = np.full((120, 240, 3), (30, 120, 40), np.uint8)
-    cv2.line(frame, (0, 25), (239, 25), (245, 245, 245), 4)
-    cv2.line(frame, (0, 95), (239, 95), (245, 245, 245), 4)
-    for x in (50, 100, 150, 200):
-        cv2.line(frame, (x, 25), (x, 95), (245, 245, 245), 2)
-    boxes = np.asarray([[100, 35, 120, 70], [30, 0, 50, 15], [180, 97, 200, 115]], float)
-    kept, scores = _on_field_detections(frame, boxes, np.asarray([.9, .8, .7]), margin_pixels=2)
-    assert kept.tolist() == [[100, 35, 120, 70]]
-    assert scores.tolist() == [.9]
-
-
 def test_fuse_sources_averages_nearby_field_positions(tmp_path: Path):
     left = tmp_path / "left.parquet"
     right = tmp_path / "right.parquet"

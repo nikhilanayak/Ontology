@@ -130,9 +130,6 @@ def _on_field_detections(frame: np.ndarray, boxes: np.ndarray, scores: np.ndarra
         return boxes, scores
     mask = np.zeros(frame.shape[:2], np.uint8)
     cv2.drawContours(mask, [cv2.convexHull(contour)], -1, 255, -1)
-    boundary = _sideline_interior_mask(frame, mask)
-    if boundary is not None:
-        mask = cv2.bitwise_and(mask, boundary)
     mask = cv2.dilate(mask, np.ones((2 * margin_pixels + 1, 2 * margin_pixels + 1), np.uint8))
     height, width = mask.shape
     keep = []
@@ -142,78 +139,6 @@ def _on_field_detections(frame: np.ndarray, boxes: np.ndarray, scores: np.ndarra
         keep.append(bool(mask[y, x]))
     keep = np.asarray(keep, dtype=bool)
     return boxes[keep], scores[keep]
-
-
-def _sideline_interior_mask(frame: np.ndarray, field_mask: np.ndarray) -> Optional[np.ndarray]:
-    """Find the strip between two long painted sidelines when both are visible.
-
-    Color alone cannot separate the playing surface from green bench turf.  Two
-    long, roughly parallel white boundaries provide a stronger cue.  The
-    routine is intentionally conservative: an uncertain pair returns ``None``
-    and leaves the existing field mask unchanged.
-    """
-    height, width = field_mask.shape
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    white = ((gray > 155) & (hsv[:, :, 1] < 105) & (field_mask > 0)).astype(np.uint8) * 255
-    edges = cv2.Canny(white, 50, 150)
-    try:
-        # Yard lines are the repeated line family. Sidelines belong to the
-        # other dominant orientation, regardless of camera angle.
-        from .field_registration import detect_yard_lines
-        yard_lines, _, _ = detect_yard_lines(frame)
-        yard_vector = yard_lines[0][1] - yard_lines[0][0]
-        yard_angle = float(np.mod(np.arctan2(yard_vector[1], yard_vector[0]), np.pi))
-    except ValueError:
-        return None
-    raw = cv2.HoughLines(edges, 1, np.pi / 720, threshold=max(80, int(width * .09)))
-    if raw is None:
-        return None
-    candidates = []
-    for rank, (rho, theta) in enumerate(raw[:1200, 0, :]):
-        line_angle = float(np.mod(theta + np.pi / 2, np.pi))
-        angle_from_yard = abs(((line_angle - yard_angle + np.pi / 2) % np.pi) - np.pi / 2)
-        if angle_from_yard < np.deg2rad(20):
-            continue
-        normal = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
-        tangent = np.asarray([-normal[1], normal[0]], dtype=float)
-        point = float(rho) * normal
-        candidates.append((point, tangent, normal, float(rho), rank))
-    if len(candidates) < 2:
-        return None
-    center = np.asarray([width / 2, height / 2], dtype=float)
-    best = None
-    for first_index, first in enumerate(candidates):
-        for second in candidates[first_index + 1:]:
-            angle = np.arccos(np.clip(abs(float(first[1] @ second[1])), 0, 1))
-            if angle > np.deg2rad(12):
-                continue
-            # Measure boundary separation through the image center. Duplicate
-            # Hough edges from the same painted stripe are only a few pixels apart.
-            separation = abs(float((second[0] - first[0]) @ first[2]))
-            if separation < .32 * height:
-                continue
-            # Hough output is vote ordered. Prefer a widely separated pair of
-            # strongly supported lines over late text/logo artifacts.
-            score = separation - .5 * (first[4] + second[4])
-            if best is None or score > best[0]:
-                best = (score, first, second)
-    if best is None:
-        return None
-    _, first, second = best
-    yy, xx = np.indices((height, width), dtype=float)
-    points = np.stack([xx, yy], axis=-1)
-    inside = np.ones((height, width), dtype=bool)
-    for point, _, normal, _, _ in (first, second):
-        center_sign = float((center - point) @ normal)
-        if abs(center_sign) < 1:
-            return None
-        signed = (points[..., 0] - point[0]) * normal[0] + (points[..., 1] - point[1]) * normal[1]
-        inside &= signed * center_sign >= 0
-    fraction = float(inside.mean())
-    if not .18 <= fraction <= .82 or not inside[height // 2, width // 2]:
-        return None
-    return inside.astype(np.uint8) * 255
 
 
 def _clip_record(db_path: Path, clip_id: str):

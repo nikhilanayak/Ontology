@@ -187,11 +187,13 @@ class FieldSpaceTracker:
     appearance_scale = np.asarray([50, 30, 30, 45, 60, 60], dtype=float)
 
     def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
-                 high_confidence: float = .55, low_confidence: float = .15):
+                 high_confidence: float = .55, low_confidence: float = .15,
+                 maximum_identities: int = 30):
         self.maximum_missed = maximum_missed
         self.maximum_speed_yps = maximum_speed_yps
         self.high_confidence = high_confidence
         self.low_confidence = low_confidence
+        self.maximum_identities = maximum_identities
         self.active: list[FieldTrack] = []
         self.next_id = 1
 
@@ -274,12 +276,18 @@ class FieldSpaceTracker:
             if track_index not in matched_tracks:
                 track.missed += 1
         self.active = [track for track in self.active if track.missed <= self.maximum_missed]
-        for index, position in enumerate(positions):
+        # Detector outputs are normally score ordered, but make the roster
+        # bootstrap deterministic. Once its generous 22-player-plus-officials
+        # budget is full, a later bench pan cannot create dozens of identities.
+        for index in np.argsort(-confidences):
+            position = positions[index]
             if assigned[index] >= 0:
                 continue
             # Very weak detections may recover an existing track but do not create
             # new identities of their own.
             if confidences[index] < self.high_confidence:
+                continue
+            if self.next_id > self.maximum_identities:
                 continue
             track = FieldTrack(self.next_id, position, np.zeros(2), teams[index], appearances[index],
                                timestamp, confidence=float(confidences[index]))
