@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import field_tracking
 from .db import connect, transaction
 
 
@@ -23,6 +24,17 @@ class AuditUpdate(BaseModel):
 class SourceTimingUpdate(BaseModel):
     snap_s: float
     play_end_s: float
+
+
+class CalibrationUpdate(BaseModel):
+    keyframes: list[dict]
+
+
+class ActionTimingUpdate(BaseModel):
+    formation_start_s: float
+    snap_s: float
+    dead_s: float
+    playback_end_s: float
 
 
 def _review_priority(play: dict) -> tuple[float, list[str]]:
@@ -139,6 +151,100 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             candidates.append(play)
         candidates.sort(key=lambda value: (-value["review_priority"], value["ordinal"]))
         return candidates[:limit]
+
+    @app.get("/api/games/{game_id}/shots")
+    def shots(game_id: str):
+        with connect(db_path) as connection:
+            rows = connection.execute(
+                """SELECT c.*,COUNT(DISTINCT a.action_id) AS action_count,
+                          COUNT(DISTINCT k.timestamp_s) AS calibration_keyframes
+                   FROM clips c LEFT JOIN action_windows a ON a.clip_id=c.clip_id
+                   LEFT JOIN shot_calibration_keyframes k ON k.clip_id=c.clip_id
+                   WHERE c.game_id=? GROUP BY c.clip_id ORDER BY c.start_s""", (game_id,),
+            ).fetchall()
+            artifacts = connection.execute(
+                """SELECT clip_id,kind,path,metadata_json,created_at FROM artifacts
+                   WHERE game_id=? AND clip_id IS NOT NULL ORDER BY artifact_id""", (game_id,),
+            ).fetchall()
+        by_clip: dict[str, list[dict]] = {}
+        for row in artifacts:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            by_clip.setdefault(item.pop("clip_id"), []).append(item)
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["artifacts"] = by_clip.get(item["clip_id"], [])
+            values.append(item)
+        return values
+
+    @app.get("/api/clips/{clip_id}/actions")
+    def clip_actions(clip_id: str):
+        with connect(db_path) as connection:
+            rows = connection.execute(
+                "SELECT * FROM action_windows WHERE clip_id=? ORDER BY action_order", (clip_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["diagnostics"] = json.loads(item.pop("diagnostics_json") or "{}")
+            values.append(item)
+        return values
+
+    @app.put("/api/clips/{clip_id}/calibration")
+    def save_calibration(clip_id: str, update: CalibrationUpdate):
+        try:
+            values = field_tracking.save_calibration_keyframes(db_path, clip_id, update.model_dump())
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return {"clip_id": clip_id, "keyframes": values}
+
+    @app.put("/api/actions/{action_id}/timing")
+    def save_action_timing(action_id: str, timing: ActionTimingUpdate):
+        with transaction(db_path) as connection:
+            row = connection.execute(
+                """SELECT c.start_s,c.end_s FROM action_windows a JOIN clips c ON c.clip_id=a.clip_id
+                   WHERE a.action_id=?""", (action_id,),
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "Action not found")
+            values = [timing.formation_start_s, timing.snap_s, timing.dead_s, timing.playback_end_s]
+            if values != sorted(values) or not (row["start_s"] <= values[0] and values[-1] <= row["end_s"]):
+                raise HTTPException(422, "Timing must be ordered and remain inside its camera shot")
+            connection.execute(
+                """UPDATE action_windows SET formation_start_s=?,snap_s=?,dead_s=?,playback_end_s=?,
+                   status='verified' WHERE action_id=?""", (*values, action_id),
+            )
+        return {"action_id": action_id, **timing.model_dump(), "status": "verified"}
+
+    @app.get("/api/clips/{clip_id}/tracks")
+    def clip_tracks(clip_id: str, stride: int = Query(1, ge=1, le=20)):
+        with connect(db_path) as connection:
+            row = connection.execute(
+                """SELECT path FROM artifacts WHERE clip_id=? AND kind='clip_tracks'
+                   ORDER BY artifact_id DESC LIMIT 1""", (clip_id,),
+            ).fetchone()
+        if not row or not Path(row["path"]).exists():
+            raise HTTPException(404, "Clip trajectory artifact not found")
+        frame = pd.read_parquet(row["path"])
+        timestamps = sorted(frame.video_timestamp.unique())[::stride]
+        frame = frame[frame.video_timestamp.isin(timestamps)]
+        return frame.where(pd.notnull(frame), None).to_dict(orient="records")
+
+    @app.get("/api/games/{game_id}/action-alignments")
+    def action_alignments(game_id: str):
+        with connect(db_path) as connection:
+            rows = connection.execute(
+                """SELECT o.*,p.description,p.play_type FROM action_alignment_operations o
+                   LEFT JOIN pbp_plays p ON p.game_id=o.game_id AND p.ordinal=o.pbp_ordinal
+                   WHERE o.game_id=? ORDER BY o.sequence_no""", (game_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["diagnostics"] = json.loads(item.pop("diagnostics_json") or "{}")
+            values.append(item)
+        return values
 
     @app.put("/api/plays/{play_id}/audit")
     def save_audit(play_id: str, audit: AuditUpdate):

@@ -24,6 +24,10 @@ def test_game_and_static_endpoints(tmp_path: Path):
                VALUES('c1','g','sideline',10,22,.9)"""
         )
         connection.execute(
+            """INSERT INTO action_windows(action_id,clip_id,action_order,formation_start_s,snap_s,
+               dead_s,playback_end_s,confidence,status) VALUES('a1','c1',1,11,12,19,20,.8,'candidate')"""
+        )
+        connection.execute(
             """INSERT INTO play_alignments(play_id,game_id,pbp_ordinal,score,status)
                VALUES('p1','g',1,.1,'pending')"""
         )
@@ -59,3 +63,11 @@ def test_game_and_static_endpoints(tmp_path: Path):
     source = client.get("/api/plays/p1/sources").json()[0]
     assert source["snap_s"] == 12.5
     assert source["play_end_s"] == 20.5
+    shots = client.get("/api/games/g/shots").json()
+    assert shots[0]["action_count"] == 1
+    assert client.get("/api/clips/c1/actions").json()[0]["action_id"] == "a1"
+    response = client.put("/api/actions/a1/timing", json={
+        "formation_start_s": 11.5, "snap_s": 12.5, "dead_s": 18.5, "playback_end_s": 20,
+    })
+    assert response.status_code == 200
+    assert client.get("/api/clips/c1/actions").json()[0]["status"] == "verified"

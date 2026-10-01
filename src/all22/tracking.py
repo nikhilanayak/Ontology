@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
-from .db import connect
+from .db import connect, transaction
 from .geometry import estimate_homography, project_points
 
 
@@ -92,6 +93,123 @@ class TorchvisionPersonDetector:
         boxes = result["boxes"][keep].detach().cpu().numpy()
         scores = result["scores"][keep].detach().cpu().numpy()
         return boxes, scores
+
+
+def _appearance_features(frame: np.ndarray, box: np.ndarray) -> dict:
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = box.astype(float)
+    # The upper torso is more useful for team color than helmets, legs, or turf.
+    left = max(0, min(width - 1, round(x1 + .20 * (x2 - x1))))
+    right = max(left + 1, min(width, round(x1 + .80 * (x2 - x1))))
+    top = max(0, min(height - 1, round(y1 + .10 * (y2 - y1))))
+    bottom = max(top + 1, min(height, round(y1 + .60 * (y2 - y1))))
+    crop = frame[top:bottom, left:right]
+    if not crop.size:
+        return {name: None for name in ("lab_l", "lab_a", "lab_b", "hsv_h", "hsv_s", "hsv_v")}
+    lab = np.median(cv2.cvtColor(crop, cv2.COLOR_BGR2LAB).reshape(-1, 3), axis=0)
+    hsv = np.median(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3), axis=0)
+    return {"lab_l": float(lab[0]), "lab_a": float(lab[1]), "lab_b": float(lab[2]),
+            "hsv_h": float(hsv[0]), "hsv_s": float(hsv[1]), "hsv_v": float(hsv[2])}
+
+
+def _clip_record(db_path: Path, clip_id: str):
+    with connect(db_path) as connection:
+        row = connection.execute(
+            """SELECT c.*,g.video_path FROM clips c JOIN games g ON g.game_id=c.game_id
+               WHERE c.clip_id=?""", (clip_id,),
+        ).fetchone()
+    if not row:
+        raise ValueError(f"No camera shot found: {clip_id}")
+    return row
+
+
+def _config_hash(value: dict) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10.0,
+                threshold: float = .35, device: Optional[str] = None, detector=None) -> int:
+    """Detect people in one hard-cut-bounded shot, independent of PBP alignment."""
+    if sample_hz <= 0:
+        raise ValueError("sample_hz must be positive")
+    source = _clip_record(db_path, clip_id)
+    detector = detector or TorchvisionPersonDetector(device, threshold)
+    capture = cv2.VideoCapture(source["video_path"])
+    if not capture.isOpened():
+        raise ValueError(f"Could not open {source['video_path']}")
+    source_fps = capture.get(cv2.CAP_PROP_FPS)
+    every = max(1, round(source_fps / sample_hz))
+    capture.set(cv2.CAP_PROP_POS_MSEC, float(source["start_s"]) * 1000)
+    records = []
+    decoded = sample_index = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            timestamp = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000
+            if timestamp > float(source["end_s"]):
+                break
+            if decoded % every == 0:
+                boxes, scores = detector.predict(frame)
+                for detection_index, (box, score) in enumerate(zip(boxes, scores)):
+                    x1, y1, x2, y2 = (float(value) for value in box)
+                    records.append({"game_id": source["game_id"], "clip_id": clip_id,
+                                    "frame_id": sample_index, "video_timestamp": timestamp,
+                                    "detection_id": detection_index, "x1": x1, "y1": y1,
+                                    "x2": x2, "y2": y2, "contact_x": (x1 + x2) / 2,
+                                    "contact_y": y2, "confidence": float(score),
+                                    "model_version": detector.model_version,
+                                    **_appearance_features(frame, np.asarray(box))})
+                sample_index += 1
+            decoded += 1
+    finally:
+        capture.release()
+    if not records:
+        raise ValueError(f"Person detector produced no candidates for {clip_id}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(records).to_parquet(output, index=False)
+    config = {"sample_hz": sample_hz, "threshold": threshold,
+              "model_version": detector.model_version}
+    with transaction(db_path) as connection:
+        connection.execute(
+            """INSERT INTO artifacts(game_id,clip_id,kind,path,model_version,metadata_json,config_hash,input_revision)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (source["game_id"], clip_id, "clip_detections", str(output.resolve()),
+             detector.model_version, json.dumps({"rows": len(records), **config}),
+             _config_hash(config), f"{source['start_s']:.3f}:{source['end_s']:.3f}"),
+        )
+    return len(records)
+
+
+def detect_clips(db_path: Path, game_id: str, output_dir: Path, sample_hz: float = 10.0,
+                 threshold: float = .35, device: Optional[str] = None,
+                 clip_ids: Optional[list[str]] = None, limit: Optional[int] = None,
+                 resume: bool = True, detector=None) -> list[dict]:
+    """Batch clip detection while loading the model only once."""
+    with connect(db_path) as connection:
+        available = connection.execute(
+            "SELECT clip_id FROM clips WHERE game_id=? ORDER BY start_s", (game_id,),
+        ).fetchall()
+    wanted = set(clip_ids or [])
+    selected = [row["clip_id"] for row in available if not wanted or row["clip_id"] in wanted]
+    if wanted - set(selected):
+        raise ValueError(f"Unknown clip IDs: {sorted(wanted - set(selected))}")
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        selected = selected[:limit]
+    detector = detector or TorchvisionPersonDetector(device, threshold)
+    results = []
+    for clip_id in selected:
+        output = output_dir / game_id / f"{clip_id}.parquet"
+        if resume and output.exists():
+            results.append({"clip_id": clip_id, "output": str(output), "status": "cached"})
+            continue
+        rows = detect_clip(db_path, clip_id, output, sample_hz, threshold, device, detector)
+        results.append({"clip_id": clip_id, "output": str(output), "status": "created", "rows": rows})
+    return results
 
 
 def _source_record(db_path: Path, play_id: str, source_order: int):

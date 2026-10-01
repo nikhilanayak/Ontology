@@ -104,6 +104,74 @@ CREATE TABLE IF NOT EXISTS artifacts (
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS action_windows (
+  action_id TEXT PRIMARY KEY,
+  clip_id TEXT NOT NULL,
+  action_order INTEGER NOT NULL,
+  formation_start_s REAL,
+  snap_s REAL,
+  dead_s REAL,
+  playback_end_s REAL,
+  confidence REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'candidate',
+  diagnostics_json TEXT NOT NULL DEFAULT '{}',
+  UNIQUE (clip_id, action_order),
+  FOREIGN KEY (clip_id) REFERENCES clips(clip_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_action_windows_clip ON action_windows(clip_id, action_order);
+CREATE TABLE IF NOT EXISTS shot_calibration_keyframes (
+  clip_id TEXT NOT NULL,
+  timestamp_s REAL NOT NULL,
+  landmarks_json TEXT NOT NULL,
+  matrix_json TEXT NOT NULL,
+  inlier_ratio REAL NOT NULL,
+  median_error_yards REAL NOT NULL,
+  p95_error_yards REAL NOT NULL,
+  revision INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'verified',
+  PRIMARY KEY (clip_id, timestamp_s),
+  FOREIGN KEY (clip_id) REFERENCES clips(clip_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS action_pairs (
+  pair_id TEXT PRIMARY KEY,
+  primary_action_id TEXT NOT NULL UNIQUE,
+  alternate_action_id TEXT UNIQUE,
+  score REAL NOT NULL,
+  status TEXT NOT NULL,
+  synchronization_json TEXT NOT NULL DEFAULT '{}',
+  diagnostics_json TEXT NOT NULL DEFAULT '{}',
+  FOREIGN KEY (primary_action_id) REFERENCES action_windows(action_id) ON DELETE CASCADE,
+  FOREIGN KEY (alternate_action_id) REFERENCES action_windows(action_id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS pbp_action_alignments (
+  game_id TEXT NOT NULL,
+  pbp_ordinal INTEGER NOT NULL,
+  pair_id TEXT,
+  action_id TEXT,
+  score REAL NOT NULL,
+  status TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  diagnostics_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (game_id, pbp_ordinal),
+  FOREIGN KEY (game_id, pbp_ordinal) REFERENCES pbp_plays(game_id, ordinal) ON DELETE CASCADE,
+  FOREIGN KEY (pair_id) REFERENCES action_pairs(pair_id) ON DELETE SET NULL,
+  FOREIGN KEY (action_id) REFERENCES action_windows(action_id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS action_alignment_operations (
+  operation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  game_id TEXT NOT NULL,
+  sequence_no INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  pbp_ordinal INTEGER,
+  pair_id TEXT,
+  score REAL NOT NULL,
+  status TEXT NOT NULL,
+  diagnostics_json TEXT NOT NULL DEFAULT '{}',
+  UNIQUE (game_id, sequence_no),
+  FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE,
+  FOREIGN KEY (game_id, pbp_ordinal) REFERENCES pbp_plays(game_id, ordinal) ON DELETE CASCADE,
+  FOREIGN KEY (pair_id) REFERENCES action_pairs(pair_id) ON DELETE SET NULL
+);
 CREATE TABLE IF NOT EXISTS game_external_ids (
   game_id TEXT NOT NULL,
   provider TEXT NOT NULL,
@@ -136,6 +204,15 @@ def connect(path: Path) -> sqlite3.Connection:
 def initialize(path: Path) -> None:
     with connect(path) as connection:
         connection.executescript(SCHEMA)
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(artifacts)")}
+        for name, declaration in (
+            ("clip_id", "TEXT"), ("action_id", "TEXT"),
+            ("config_hash", "TEXT"), ("input_revision", "TEXT"),
+        ):
+            if name not in columns:
+                connection.execute(f"ALTER TABLE artifacts ADD COLUMN {name} {declaration}")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_clip_kind ON artifacts(clip_id,kind)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_artifacts_action_kind ON artifacts(action_id,kind)")
 
 
 @contextmanager

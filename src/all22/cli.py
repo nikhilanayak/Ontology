@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import alignment, bdb, db, nflverse, pfr, pilot, remote_download, supervision, tracking, video
+from . import action_alignment, actions, alignment, bdb, db, field_tracking, nflverse, pfr, pilot, remote_download, supervision, tracking, video, workflow
 from . import pipeline
 
 
@@ -100,6 +100,16 @@ def parser() -> argparse.ArgumentParser:
     detect.add_argument("--device")
     detect.add_argument("--output", type=Path, required=True)
 
+    detect_clips = commands.add_parser("detect-clips")
+    detect_clips.add_argument("--game-id", required=True)
+    detect_clips.add_argument("--clip-id", action="append", dest="clip_ids")
+    detect_clips.add_argument("--sample-hz", type=float, default=10.0)
+    detect_clips.add_argument("--threshold", type=float, default=.35)
+    detect_clips.add_argument("--device")
+    detect_clips.add_argument("--limit", type=int)
+    detect_clips.add_argument("--no-resume", action="store_true")
+    detect_clips.add_argument("--output-dir", type=Path, default=ROOT / "data" / "detections")
+
     project = commands.add_parser("project-source")
     project.add_argument("--play-id", required=True)
     project.add_argument("--source-order", type=int, required=True)
@@ -108,6 +118,40 @@ def parser() -> argparse.ArgumentParser:
     project.add_argument("--output", type=Path, required=True)
     project.add_argument("--video-anchor-s", type=float)
     project.add_argument("--bdb-anchor-frame", type=int)
+
+    calibrate_clip = commands.add_parser("calibrate-clip")
+    calibrate_clip.add_argument("--clip-id", required=True)
+    calibrate_clip.add_argument("landmarks", type=Path)
+
+    project_clip = commands.add_parser("project-clip")
+    project_clip.add_argument("--clip-id", required=True)
+    project_clip.add_argument("--detections", type=Path, required=True)
+    project_clip.add_argument("--output", type=Path, required=True)
+
+    track_clip = commands.add_parser("track-clip")
+    track_clip.add_argument("--clip-id", required=True)
+    track_clip.add_argument("--projected", type=Path, required=True)
+    track_clip.add_argument("--output", type=Path, required=True)
+
+    discover_actions = commands.add_parser("discover-actions")
+    discover_actions.add_argument("--clip-id", required=True)
+    discover_actions.add_argument("--tracks", type=Path, required=True)
+
+    pair_actions = commands.add_parser("pair-actions")
+    pair_actions.add_argument("--game-id", required=True)
+    pair_actions.add_argument("--tracks-dir", type=Path, default=ROOT / "data" / "clip-tracks")
+
+    align_actions = commands.add_parser("align-actions")
+    align_actions.add_argument("--game-id", required=True)
+
+    reconstruct = commands.add_parser("reconstruct-clip")
+    reconstruct.add_argument("--clip-id", required=True)
+    reconstruct.add_argument("--detections", type=Path, required=True)
+    reconstruct.add_argument("--output-root", type=Path, default=ROOT / "data")
+
+    trajectory_report = commands.add_parser("trajectory-pilot-report")
+    trajectory_report.add_argument("--game-id", required=True)
+    trajectory_report.add_argument("--output", type=Path)
 
     fuse = commands.add_parser("fuse-sources")
     fuse.add_argument("--output", type=Path, required=True)
@@ -225,11 +269,42 @@ def main() -> None:
         rows = tracking.detect_source(args.db, args.play_id, args.source_order, args.output,
                                       args.sample_hz, args.threshold, args.device)
         print(json.dumps({"rows": rows, "output": str(args.output)}))
+    elif args.command == "detect-clips":
+        results = tracking.detect_clips(
+            args.db, args.game_id, args.output_dir, args.sample_hz, args.threshold,
+            args.device, args.clip_ids, args.limit, not args.no_resume,
+        )
+        print(json.dumps({"game_id": args.game_id, "clips": len(results), "results": results}, indent=2))
     elif args.command == "project-source":
         result = tracking.project_source(args.db, args.play_id, args.source_order,
                                          args.detections, args.landmarks, args.output,
                                          args.video_anchor_s, args.bdb_anchor_frame)
         print(json.dumps({**result, "output": str(args.output)}, indent=2))
+    elif args.command == "calibrate-clip":
+        payload = json.loads(args.landmarks.read_text(encoding="utf-8"))
+        print(json.dumps({"clip_id": args.clip_id,
+                          "keyframes": field_tracking.save_calibration_keyframes(args.db, args.clip_id, payload)},
+                         indent=2))
+    elif args.command == "project-clip":
+        result = field_tracking.project_clip(args.db, args.clip_id, args.detections, args.output)
+        print(json.dumps({**result, "output": str(args.output)}, indent=2))
+    elif args.command == "track-clip":
+        result = field_tracking.track_projected_clip(args.db, args.clip_id, args.projected, args.output)
+        print(json.dumps({**result, "output": str(args.output)}, indent=2))
+    elif args.command == "discover-actions":
+        values = actions.discover_clip_actions(args.db, args.clip_id, args.tracks)
+        print(json.dumps({"clip_id": args.clip_id, "actions": values}, indent=2))
+    elif args.command == "pair-actions":
+        values = actions.pair_game_actions(args.db, args.game_id, args.tracks_dir)
+        print(json.dumps({"game_id": args.game_id, "pairs": values}, indent=2))
+    elif args.command == "align-actions":
+        values = action_alignment.align_game_actions(args.db, args.game_id)
+        print(json.dumps({"game_id": args.game_id, "operations": values}, indent=2))
+    elif args.command == "reconstruct-clip":
+        print(json.dumps(workflow.reconstruct_clip(args.db, args.clip_id, args.detections,
+                                                   args.output_root), indent=2))
+    elif args.command == "trajectory-pilot-report":
+        print(json.dumps(workflow.write_pilot_report(args.db, args.game_id, args.output), indent=2))
     elif args.command == "fuse-sources":
         rows = tracking.fuse_sources(args.inputs, args.output)
         print(json.dumps({"rows": rows, "output": str(args.output)}))

@@ -5,19 +5,27 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>All-22 Reconstruction</title>
   <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/trajectory.css">
 </head>
 <body>
   <header><h1>All-22 Reconstruction</h1><span id="status">Loading…</span></header>
   <main>
     <aside>
       <label>Game<select id="games"></select></label>
-      <p class="queue-help">Only high-value, unreviewed plays are shown. Saving advances to the next one.</p>
+      <label>Workspace<select id="workspace-mode"><option value="shots">Trajectory shots</option><option value="audit">Alignment audit</option></select></label>
+      <p id="queue-help" class="queue-help">Camera shots are processed independently before repeated views are paired.</p>
       <div id="plays"></div>
     </aside>
     <section class="workspace">
       <div class="summary"><h2 id="play-title">Select a play</h2><p id="play-detail"></p></div>
-      <video id="film" controls preload="metadata"></video>
+      <div class="video-stage"><video id="film" controls preload="metadata"></video><canvas id="overlay"></canvas></div>
       <div id="sources" class="sources"></div>
+      <fieldset id="calibration" hidden>
+        <legend>Shot calibration</legend>
+        <p>Paste timestamped image↔field landmark sets (pixels to yards).</p>
+        <textarea id="calibration-json" rows="5" placeholder='{"keyframes":[{"timestamp_s":12.0,"image_points":[...],"field_points":[...]}]}'></textarea>
+        <button id="calibration-save">Save calibration</button><span id="calibration-status"></span>
+      </fieldset>
       <fieldset id="audit" hidden>
         <legend>Alignment audit</legend>
         <label><input id="audit-mapping" type="checkbox"> Correct play</label>

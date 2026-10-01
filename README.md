@@ -180,6 +180,60 @@ The pilot does **not** train an end-to-end recognition model. It runs a frozen
 Torchvision Faster R-CNN COCO person detector, associates boxes over time, and
 uses the bottom-center of each box as the player's contact point:
 
+The current trajectory path is camera-shot centric. Hard cuts establish the
+only mandatory media boundaries; a shot may contain zero, one, or several
+complete actions. Detection therefore runs before play alignment:
+
+```bash
+.venv/bin/all22 detect-clips \
+  --game-id bills-at-rams-2022-reg-1 --device cuda --limit 4
+```
+
+For each shot, add one or more calibration keyframes. Every keyframe contains
+at least four image/field point pairs; multiple keyframes let the homography
+follow a pan or zoom without treating it as a cut:
+
+```json
+{
+  "keyframes": [
+    {
+      "timestamp_s": 123.4,
+      "image_points": [[310,170],[1610,180],[180,900],[1740,920]],
+      "field_points": [[40,0],[60,0],[40,53.333],[60,53.333]]
+    }
+  ]
+}
+```
+
+```bash
+.venv/bin/all22 calibrate-clip --clip-id SHOT_ID data/landmarks/SHOT_ID.json
+.venv/bin/all22 reconstruct-clip \
+  --clip-id SHOT_ID --detections data/detections/SHOT_ID.parquet
+```
+
+`reconstruct-clip` projects each bottom-center contact point, assigns anonymous
+team clusters, tracks in field coordinates, and discovers every motion-defined
+action wholly contained in that shot. Calibration extrapolation is marked
+invalid rather than silently used. Review the action boundaries in the viewer,
+then pair repeated presentations and align them to play-by-play:
+
+```bash
+.venv/bin/all22 pair-actions \
+  --game-id bills-at-rams-2022-reg-1 --tracks-dir data/clip-tracks
+.venv/bin/all22 align-actions --game-id bills-at-rams-2022-reg-1
+.venv/bin/all22 trajectory-pilot-report \
+  --game-id bills-at-rams-2022-reg-1 --output data/reports/trajectory-pilot.json
+```
+
+Pairing uses duration, player counts, formation geometry, displacement, and a
+normalized speed profile. It leaves ambiguous repetitions single. The PBP
+aligner uses explicit `missing_film` and `extra_film` operations, ignores
+timeouts, retains filmed penalties, and keeps uncertain matches reviewable.
+The first experiment is ready only after 10 action windows are manually marked
+`verified`; it does not require jersey identities or ball tracking.
+
+The legacy play-source command remains available for comparison:
+
 ```bash
 .venv/bin/all22 detect-source \
   --play-id bills-at-rams-2022-reg-1:0001 --source-order 0 \
@@ -238,7 +292,10 @@ least 80% of BDB player-frames matched within 3 yards.
 npm run cv:serve
 ```
 
-Open `http://127.0.0.1:8000`. The viewer displays PFR plays, local film, quality diagnostics, and any accepted trajectory Parquet files stored as `data/trajectories/<play-id>.parquet`.
+Open `http://127.0.0.1:8000`. The default trajectory workspace lists independent
+camera shots and overlays anonymous boxes on video and player positions on the
+2D field. It also accepts calibration keyframe JSON and exposes discovered
+action windows. Switch to **Alignment audit** for the earlier PBP review queue.
 
 ## Verification
 
@@ -246,15 +303,19 @@ Open `http://127.0.0.1:8000`. The viewer displays PFR plays, local film, quality
 npm run cv:test
 ```
 
-Tests cover PFR parsing, BDB schema aliases and snap normalization, monotonic alignment, homography recovery, rigid rejection gates, camera-angle classification, and API/static application behavior.
+Tests cover PFR parsing, BDB schema aliases and snap normalization, monotonic
+alignment with gaps, multi-action shots, repeat pairing, homography recovery,
+field-space tracking, calibration validity, rigid rejection gates,
+camera-angle classification, and API/static application behavior.
 
 ## Current implementation boundary
 
-The data contracts, direct-to-production acquisition, BDB ingestion, dual-source
-alignment/auditing, calibration utilities, frozen detector, deterministic box
-tracking, geometric fusion, evaluator, API, and viewer are operational.
-Automated field-keypoint detection, stronger tracking, team classification,
-and any targeted fine-tuning remain subsequent experiments; jersey OCR and
-player identity are explicitly outside this pilot.
+The data contracts, direct-to-production acquisition, BDB ingestion, independent
+shot detection, keyframed calibration, field-space tracking, multi-action
+discovery, conservative repeated-view pairing, gap-aware PBP alignment, pilot
+report, API, and viewer are operational. Team labels are anonymous color
+clusters. Automated field-keypoint initialization, learned football-specific
+detection, ball tracking, and targeted fine-tuning remain later experiments;
+jersey OCR and player identity are explicitly outside this pilot.
 
 Keep NFL footage, browser profiles, signed URLs, BDB-derived artifacts, and reconstructed trajectories private and comply with the applicable source licenses and service terms.

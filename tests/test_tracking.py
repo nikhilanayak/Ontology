@@ -6,7 +6,42 @@ import pandas as pd
 import json
 
 from all22.db import initialize, transaction
-from all22.tracking import BoxTracker, fuse_sources, project_source
+from all22.tracking import BoxTracker, detect_clip, fuse_sources, project_source
+
+
+class FakeDetector:
+    model_version = "fake:person:v1"
+
+    def predict(self, frame):
+        return np.asarray([[10, 5, 30, 45]], dtype=float), np.asarray([.9], dtype=float)
+
+
+def test_clip_detection_is_independent_of_play_alignment(tmp_path: Path):
+    import cv2
+
+    database = tmp_path / "db.sqlite3"
+    initialize(database)
+    video = tmp_path / "film.avi"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (64, 48))
+    for _ in range(20):
+        writer.write(np.full((48, 64, 3), (30, 120, 40), dtype=np.uint8))
+    writer.release()
+    with transaction(database) as connection:
+        connection.execute("INSERT INTO games(game_id,video_path) VALUES('g',?)", (str(video),))
+        connection.execute(
+            "INSERT INTO clips(clip_id,game_id,angle,start_s,end_s,confidence) VALUES('c','g','unknown',0,1,0)"
+        )
+    output = tmp_path / "detections.parquet"
+    rows = detect_clip(database, "c", output, sample_hz=2, detector=FakeDetector())
+    result = pd.read_parquet(output)
+    assert rows == len(result) >= 2
+    assert set(result.clip_id) == {"c"}
+    assert {"contact_x", "contact_y", "lab_l", "hsv_h"}.issubset(result.columns)
+    with transaction(database) as connection:
+        artifact = connection.execute(
+            "SELECT kind,clip_id,model_version FROM artifacts WHERE clip_id='c'"
+        ).fetchone()
+    assert tuple(artifact) == ("clip_detections", "c", "fake:person:v1")
 
 
 def test_box_tracker_preserves_nearby_tracks():

@@ -47,6 +47,28 @@ class Clip:
 
 
 @dataclass(frozen=True)
+class ActionWindow:
+    action_id: str
+    clip_id: str
+    action_order: int
+    formation_start_s: Optional[float]
+    snap_s: Optional[float]
+    dead_s: Optional[float]
+    playback_end_s: Optional[float]
+    confidence: float = 0.0
+    status: str = "candidate"
+
+
+@dataclass(frozen=True)
+class ActionPair:
+    pair_id: str
+    primary_action_id: str
+    alternate_action_id: Optional[str]
+    score: float
+    status: str = "candidate"
+
+
+@dataclass(frozen=True)
 class TrackingSample:
     game_id: str
     play_id: str

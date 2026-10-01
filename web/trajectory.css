@@ -1,0 +1,25 @@
+.video-stage {
+  position: relative;
+  margin: 12px 0;
+}
+.video-stage video {
+  display: block;
+  margin: 0;
+}
+.video-stage #overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+}
+textarea {
+  width: 100%;
+  flex-basis: 100%;
+  padding: 8px;
+  background: #17221e;
+  color: white;
+  border: 1px solid #395044;
+}
