@@ -137,11 +137,20 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             field = cv2.morphologyEx(green, cv2.MORPH_CLOSE, close_kernel)
             field = cv2.dilate(field, close_kernel, iterations=1)
             values = difference[field > 0]
-            # Players occupy only a few percent of a wide All-22 frame. The
-            # 90th percentile mostly measures unchanged turf and misses even a
-            # full snap; the upper tail captures player residuals after the
-            # field-derived camera transform is removed.
-            raw_score = float(np.percentile(values, 97.5)) if values.size >= 1000 else 0.0
+            # Retain player-sized residual blobs while rejecting long yard-line
+            # ghosts and broad exposure changes. This better represents how
+            # many localized objects moved, rather than how aggressively the
+            # camera zoomed or panned.
+            moving = np.zeros_like(gray)
+            moving[(difference >= 22) & (field > 0)] = 255
+            moving = cv2.morphologyEx(moving, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            count, _, stats, _ = cv2.connectedComponentsWithStats(moving, connectivity=8)
+            player_area = 0
+            for component in range(1, count):
+                _, _, component_width, component_height, area = stats[component]
+                if 4 <= area <= 350 and component_width <= 24 and component_height <= 38:
+                    player_area += int(area)
+            raw_score = player_area / 10.0 if values.size >= 1000 else 0.0
             # A low affine inlier ratio is common during a live play because
             # many tracked corners belong to players.  It is therefore not a
             # scene-cut signal.  Color-distribution discontinuity is much more
