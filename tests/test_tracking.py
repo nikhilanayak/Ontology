@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -57,6 +58,16 @@ def test_people_outside_field_region_are_filtered():
     boxes = np.asarray([[80, 20, 100, 80], [0, 20, 20, 80]], float)
     kept, scores = _on_field_detections(frame, boxes, np.asarray([.9, .8]), margin_pixels=2)
     assert kept.shape == (1, 4)
+    assert scores.tolist() == [.9]
+
+
+def test_people_beyond_painted_sidelines_are_filtered():
+    frame = np.full((120, 240, 3), (30, 120, 40), np.uint8)
+    cv2.line(frame, (0, 25), (239, 25), (245, 245, 245), 4)
+    cv2.line(frame, (0, 95), (239, 95), (245, 245, 245), 4)
+    boxes = np.asarray([[100, 35, 120, 70], [30, 0, 50, 15], [180, 97, 200, 115]], float)
+    kept, scores = _on_field_detections(frame, boxes, np.asarray([.9, .8, .7]), margin_pixels=2)
+    assert kept.tolist() == [[100, 35, 120, 70]]
     assert scores.tolist() == [.9]
 
 
