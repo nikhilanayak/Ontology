@@ -231,14 +231,36 @@ def clips_from_motion_scan(path: Path, game_id: str, samples: List[MotionSample]
     maximum_gap = max(1, round(sample_fps * 2.0))
     clips: List[Clip] = []
 
-    for source_start, source_end in zip(boundaries, boundaries[1:]):
+    # Keep one decoder open for all angle samples. Opening the multi-gigabyte
+    # game three times per source is prohibitively expensive on production
+    # storage.
+    angle_votes = []
+    capture = cv2.VideoCapture(str(path))
+    try:
+        for source_start, source_end in zip(boundaries, boundaries[1:]):
+            votes = []
+            for fraction in (.25, .5, .75):
+                timestamp = source_start + (source_end - source_start) * fraction
+                capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+                ok, frame = capture.read()
+                votes.append(classify_angle(frame) if ok else (Angle.UNKNOWN, 0.0))
+            angle_votes.append(votes)
+    finally:
+        capture.release()
+
+    for (source_start, source_end), votes in zip(zip(boundaries, boundaries[1:]), angle_votes):
         if source_end - source_start < 3.0:
             continue
         source_samples = [sample for sample in samples
                           if source_start < sample.timestamp < source_end and not sample.camera_cut]
         snap = play_end = None
         confidence = 0.0
-        angle = Angle.NON_PLAY
+        # Angle voting uses the complete source, not only one action frame.
+        # Midfield logos and zoomed action can confuse a single-frame vote.
+        angle_scores = {candidate: sum(confidence for value, confidence in votes if value == candidate)
+                        for candidate in (Angle.SIDELINE, Angle.ENDZONE)}
+        angle = max(angle_scores, key=angle_scores.get)
+        angle_confidence = angle_scores[angle] / max(sum(angle_scores.values()), 1e-9)
         if len(source_samples) >= 10:
             scores = np.asarray([sample.score for sample in source_samples], dtype=float)
             smoothed = np.convolve(scores, np.ones(5) / 5, mode="same")
@@ -274,7 +296,6 @@ def clips_from_motion_scan(path: Path, game_id: str, samples: List[MotionSample]
                 if play_end - snap >= 1.5:
                     peak = float(smoothed[first:stop].max())
                     confidence = min(1.0, max(0.0, peak / max(activity_threshold * 3, 1.0)))
-                    angle, angle_confidence = classify_angle(frame_at(path, (snap + play_end) / 2))
                     confidence = min(confidence, max(.05, angle_confidence))
                 else:
                     snap = play_end = None
