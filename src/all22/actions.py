@@ -77,7 +77,10 @@ def discover_action_candidates(tracks: pd.DataFrame, clip_start: float, clip_end
     step = float(np.median(np.diff(times)))
     smooth_n = max(1, int(round(.5 / max(step, .01))))
     activity = timeline.moving.rolling(smooth_n, center=True, min_periods=1).mean().to_numpy()
-    active = (activity >= .28) & (timeline.players.to_numpy() >= 6)
+    median_speed = timeline.median_speed.rolling(smooth_n, center=True, min_periods=1).median().to_numpy()
+    # Pre-snap shifts move a handful of players slowly; live action produces a
+    # coordinated rise in both participation and median field-space speed.
+    active = (activity >= .28) & (median_speed >= 1.8) & (timeline.players.to_numpy() >= 6)
     # Bridge brief pauses caused by occlusion or a tackle pile.
     for left, right in _runs(~active):
         if left and right < len(active) and times[right - 1] - times[left] <= bridge_s:
