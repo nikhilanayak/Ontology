@@ -1,4 +1,5 @@
-from all22.action_alignment import ActionUnit, align_actions_to_pbp, is_filmed_event
+from all22.action_alignment import ActionUnit, align_actions_to_pbp, is_filmed_event, match_cost
+from all22.bdb import BDBPlaySignature
 from all22.models import PlayByPlay
 
 
@@ -26,3 +27,10 @@ def test_uncertain_duration_is_marked_for_review():
                                   [ActionUnit("p", "a", 13, .5)])
     assert result[0].operation == "match"
     assert result[0].status == "review"
+
+
+def test_bdb_signature_replaces_generic_duration_prior():
+    play = _play(1, "Quarterback pass", "pass")
+    unit = ActionUnit("p", "a", 3.0, .9, speed_profile=(0, 1), formation=(1, 2, 3))
+    answer = BDBPlaySignature("10", 3.1, "pass", (0, 1), (1, 2, 3), ("ball_snap", "pass_forward"))
+    assert match_cost(play, unit, answer) < match_cost(play, unit)

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional
+
+import numpy as np
+import pandas as pd
 
 from .db import transaction
 
@@ -23,6 +27,16 @@ ALIASES = {
     "event": ("event",),
     "play_direction": ("play_direction", "playDirection"),
 }
+
+
+@dataclass(frozen=True)
+class BDBPlaySignature:
+    play_id: str
+    duration: float
+    category: str
+    speed_profile: tuple[float, ...]
+    formation: tuple[float, ...]
+    events: tuple[str, ...]
 
 
 def _value(row: Dict[str, str], field: str) -> Optional[str]:
@@ -85,3 +99,45 @@ def snap_frame(db_path: Path, game_id: str, play_id: str) -> Optional[int]:
             (game_id, play_id),
         ).fetchone()
         return row["frame_id"] if row and row["frame_id"] is not None else None
+
+
+def play_signatures(db_path: Path, game_id: str) -> dict[str, BDBPlaySignature]:
+    """Build compact, angle-independent answer-key features for one game."""
+    from .db import connect
+    with connect(db_path) as connection:
+        frame = pd.read_sql_query(
+            """SELECT play_id,frame_id,nfl_id,team,x,y,speed,event FROM bdb_tracking
+               WHERE game_id=? ORDER BY CAST(play_id AS INTEGER),frame_id""",
+            connection, params=(game_id,),
+        )
+    output: dict[str, BDBPlaySignature] = {}
+    for play_id, play in frame.groupby("play_id", sort=False):
+        event_values = play.event.fillna("").astype(str).str.lower()
+        snap_rows = play[event_values.isin(("ball_snap", "autoevent_ballsnap"))]
+        if snap_rows.empty:
+            continue
+        snap = int(snap_rows.frame_id.min())
+        post = play[play.frame_id >= snap].copy()
+        duration = max(.1, (int(post.frame_id.max()) - snap) / 10.0)
+        players = post[post.nfl_id.notna()]
+        at_snap = players[players.frame_id == snap]
+        points = at_snap[["x", "y"]].to_numpy(float)
+        if len(points):
+            centered = points - np.median(points, axis=0)
+            formation = tuple(np.round(np.sort(np.hypot(centered[:, 0], centered[:, 1])), 3))
+        else:
+            formation = ()
+        edges = np.linspace(snap, int(post.frame_id.max()) + 1e-6, 9)
+        post["bin"] = np.clip(np.digitize(post.frame_id, edges) - 1, 0, 7)
+        speeds = (post[post.nfl_id.notna()].groupby("bin").speed.median().reindex(range(8))
+                  .interpolate(limit_direction="both").fillna(0.0))
+        events = tuple(sorted(set(value for value in event_values if value)))
+        if any(value in events for value in ("pass_forward", "autoevent_passforward")):
+            category = "pass"
+        elif any(value in events for value in ("handoff", "run")):
+            category = "run"
+        else:
+            category = "unknown"
+        output[str(play_id)] = BDBPlaySignature(
+            str(play_id), duration, category, tuple(speeds.astype(float)), formation, events)
+    return output

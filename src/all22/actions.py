@@ -223,6 +223,16 @@ def pair_game_actions(db_path: Path, game_id: str, tracks_dir: Path) -> list[dic
         if path.exists():
             signatures.append(signature_for_action(dict(row), pd.read_parquet(path), row["angle"]))
     proposals = pair_ordered_actions(signatures)
+    signature_by_id = {value.action_id: value for value in signatures}
+
+    def signature_payload(action_id: Optional[str]) -> Optional[dict]:
+        if not action_id or action_id not in signature_by_id:
+            return None
+        value = signature_by_id[action_id]
+        return {"duration": value.duration, "team_counts": list(value.team_counts),
+                "displacement": value.displacement, "speed_profile": list(value.speed_profile),
+                "formation": list(value.formation), "angle": value.angle}
+
     with transaction(db_path) as connection:
         old = connection.execute(
             """SELECT pair_id FROM action_pairs WHERE primary_action_id IN
@@ -232,11 +242,14 @@ def pair_game_actions(db_path: Path, game_id: str, tracks_dir: Path) -> list[dic
         connection.executemany("DELETE FROM action_pairs WHERE pair_id=?", [(row["pair_id"],) for row in old])
         for index, pair in enumerate(proposals, 1):
             pair_id = f"{game_id}:pair:{index:04d}"
+            diagnostics = {**pair.diagnostics,
+                           "primary_signature": signature_payload(pair.primary_action_id),
+                           "alternate_signature": signature_payload(pair.alternate_action_id)}
             connection.execute(
                 """INSERT INTO action_pairs(pair_id,primary_action_id,alternate_action_id,score,status,
                    synchronization_json,diagnostics_json) VALUES(?,?,?,?,?,?,?)""",
                 (pair_id, pair.primary_action_id, pair.alternate_action_id, pair.cost, pair.status, "{}",
-                 json.dumps(pair.diagnostics)),
+                 json.dumps(diagnostics)),
             )
     return [{"pair_id": f"{game_id}:pair:{index:04d}", **pair.__dict__}
             for index, pair in enumerate(proposals, 1)]
