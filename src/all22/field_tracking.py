@@ -335,6 +335,17 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     # Keep short tracklets in the artifact for diagnosis, but mark the durable
     # trajectories that should drive action discovery and the tactical map.
     result["track_reliable"] = result.track_coverage >= .35
+    reliable = result[result.track_reliable]
+    roster_scores = reliable.groupby("track_id").agg(
+        observations=("track_id", "size"),
+        mean_confidence=("confidence", "mean") if "confidence" in reliable else ("track_id", "size"),
+        median_speed=("speed", "median"),
+    )
+    roster_scores["score"] = (roster_scores.observations / total_frames
+                              + .15 * roster_scores.mean_confidence
+                              + .05 * np.minimum(roster_scores.median_speed / 3, 1))
+    roster_ids = set(roster_scores.nlargest(26, "score").index)
+    result["roster_candidate"] = result.track_id.isin(roster_ids)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output, index=False)
     with transaction(db_path) as connection:
@@ -344,8 +355,10 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
             (game_id, clip_id, "clip_tracks", str(output.resolve()),
              json.dumps({"rows": len(result), "tracks": int(result.track_id.nunique()),
                          "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
+                         "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
                          "team_labeled_fraction": float((result.team != 'unknown').mean())})),
         )
     return {"rows": len(result), "tracks": int(result.track_id.nunique()),
             "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
+            "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
             "team_labeled_fraction": float((result.team != "unknown").mean())}

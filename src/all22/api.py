@@ -258,7 +258,9 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
         if not row or not Path(row["path"]).exists():
             raise HTTPException(404, "Clip trajectory artifact not found")
         frame = pd.read_parquet(row["path"])
-        if "track_reliable" in frame:
+        if "roster_candidate" in frame:
+            frame = frame[frame.roster_candidate]
+        elif "track_reliable" in frame:
             frame = frame[frame.track_reliable]
         timestamps = sorted(frame.video_timestamp.unique())[::stride]
         frame = frame[frame.video_timestamp.isin(timestamps)]
