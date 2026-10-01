@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from all22.field_registration import OCRNumber, register_field
+from all22.field_registration import OCRNumber, read_field_numbers, register_field
 from all22.geometry import project_points
 
 
@@ -19,3 +19,14 @@ def test_line_detection_and_ocr_anchor_fit_field_template():
     assert registration.diagnostics["line_count"] >= 7
     center = project_points(registration.matrix, [[550, 300]])[0]
     assert np.allclose(center, [60, 80 / 3], atol=1.0)
+
+
+def test_ocr_normalizes_goal_arrows_and_upside_down_ten():
+    class Reader:
+        def readtext(self, *_args, **_kwargs):
+            box = [[0, 0], [20, 0], [20, 10], [0, 10]]
+            return [(box, "205", .9), (box, "305", .8), (box, "01", .7), (box, "22", .9)]
+
+    frame = np.zeros((100, 200, 3), np.uint8)
+    frame[:] = (40, 120, 40)
+    assert [value.value for value in read_field_numbers(frame, Reader())] == [20, 30, 10]

@@ -132,8 +132,15 @@ def read_field_numbers(frame: np.ndarray, reader=None) -> list[OCRNumber]:
         digits = "".join(character for character in str(text) if character.isdigit())
         if not digits:
             continue
-        number = int(digits)
-        if number not in {10, 20, 30, 40, 50} or float(confidence) < .2:
+        number = None
+        for candidate in (10, 20, 30, 40, 50):
+            label = str(candidate)
+            # The goal-pointing arrow is frequently segmented as a trailing 5,
+            # while an upside-down 10 is often returned as 01.
+            if label in digits or label[::-1] in digits:
+                number = candidate
+                break
+        if number is None or float(confidence) < .2:
             continue
         center = np.asarray(polygon, dtype=float).mean(axis=0)
         values.append(OCRNumber(number, (float(center[0]), float(center[1])), float(confidence)))
