@@ -182,6 +182,11 @@ def parser() -> argparse.ArgumentParser:
     pair.add_argument("--output-dir", type=Path, default=ROOT / "data" / "bdb-labels")
     pair.add_argument("video", type=Path)
 
+    evaluate_sources = commands.add_parser("evaluate-audited-sources")
+    evaluate_sources.add_argument("--game-id", required=True)
+    evaluate_sources.add_argument("--tracks-dir", type=Path, default=ROOT / "data" / "clip-tracks")
+    evaluate_sources.add_argument("--output", type=Path)
+
     serve = commands.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
@@ -339,6 +344,12 @@ def main() -> None:
         record = supervision.create_pair(args.db, args.manifest, args.output_dir, args.game_id,
                                          args.play_id, args.angle, args.video, args.video_snap)
         print(json.dumps(record, indent=2))
+    elif args.command == "evaluate-audited-sources":
+        value = supervision.evaluate_audited_sources(args.db, args.game_id, args.tracks_dir)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(value, indent=2))
     elif args.command == "serve":
         import uvicorn
         from .api import create_app
