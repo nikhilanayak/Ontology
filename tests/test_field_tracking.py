@@ -95,12 +95,17 @@ def test_tracker_uses_velocity_across_brief_miss():
     assert tracker.update(detection(13), .3) == [1]
 
 
-def test_tracker_does_not_spawn_an_unbounded_sideline_roster():
-    tracker = FieldSpaceTracker(maximum_identities=3)
-    detections = pd.DataFrame({
-        "field_x": range(8), "field_y": [20.0] * 8, "confidence": [.99, .98, .97, .96, .95, .94, .93, .92],
+def test_tracker_does_not_spawn_identities_during_a_sideline_burst():
+    tracker = FieldSpaceTracker(crowd_multiplier=1.5, crowd_floor=4)
+    base = pd.DataFrame({
+        "field_x": range(3), "field_y": [20.0] * 3, "confidence": [.99, .98, .97],
+        "lab_a": [100] * 3, "lab_b": [100] * 3, "team": ["team_0"] * 3,
+    })
+    assert tracker.update(base, 0.0) == [1, 2, 3]
+    burst = pd.DataFrame({
+        "field_x": range(8), "field_y": [20.0] * 8, "confidence": [.99] * 8,
         "lab_a": [100] * 8, "lab_b": [100] * 8, "team": ["team_0"] * 8,
     })
-    ids = tracker.update(detections, 0.0)
+    ids = tracker.update(burst, .1)
     assert sum(value >= 0 for value in ids) == 3
     assert tracker.next_id == 4

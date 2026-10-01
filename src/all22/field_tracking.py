@@ -188,12 +188,14 @@ class FieldSpaceTracker:
 
     def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
                  high_confidence: float = .55, low_confidence: float = .15,
-                 maximum_identities: int = 30):
+                 crowd_multiplier: float = 1.6, crowd_floor: int = 32):
         self.maximum_missed = maximum_missed
         self.maximum_speed_yps = maximum_speed_yps
         self.high_confidence = high_confidence
         self.low_confidence = low_confidence
-        self.maximum_identities = maximum_identities
+        self.crowd_multiplier = crowd_multiplier
+        self.crowd_floor = crowd_floor
+        self.nominal_detection_counts: list[int] = []
         self.active: list[FieldTrack] = []
         self.next_id = 1
 
@@ -276,9 +278,14 @@ class FieldSpaceTracker:
             if track_index not in matched_tracks:
                 track.missed += 1
         self.active = [track for track in self.active if track.missed <= self.maximum_missed]
-        # Detector outputs are normally score ordered, but make the roster
-        # bootstrap deterministic. Once its generous 22-player-plus-officials
-        # budget is full, a later bench pan cannot create dozens of identities.
+        nominal = float(np.median(self.nominal_detection_counts)) if self.nominal_detection_counts else len(detections)
+        crowd_burst = len(detections) > max(self.crowd_floor, self.crowd_multiplier * nominal)
+        if not crowd_burst:
+            self.nominal_detection_counts.append(len(detections))
+            self.nominal_detection_counts = self.nominal_detection_counts[-30:]
+        # Detector outputs are normally score ordered, but make identity births
+        # deterministic. During a sudden bench/crowd burst, existing players may
+        # still match while unrelated people cannot spawn new trajectories.
         for index in np.argsort(-confidences):
             position = positions[index]
             if assigned[index] >= 0:
@@ -287,7 +294,7 @@ class FieldSpaceTracker:
             # new identities of their own.
             if confidences[index] < self.high_confidence:
                 continue
-            if self.next_id > self.maximum_identities:
+            if crowd_burst:
                 continue
             track = FieldTrack(self.next_id, position, np.zeros(2), teams[index], appearances[index],
                                timestamp, confidence=float(confidences[index]))
