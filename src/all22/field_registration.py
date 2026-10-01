@@ -218,6 +218,36 @@ def diagnostic_image(frame: np.ndarray, registration: Registration) -> np.ndarra
     return output
 
 
+def propagate_registration(source: np.ndarray, target: np.ndarray,
+                           registration: Registration) -> Registration:
+    """Carry an anchored field registration through a no-cut camera motion."""
+    source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    detector = cv2.ORB_create(nfeatures=5000, fastThreshold=8)
+    source_keys, source_descriptors = detector.detectAndCompute(source_gray, _field_mask(source))
+    target_keys, target_descriptors = detector.detectAndCompute(target_gray, _field_mask(target))
+    if source_descriptors is None or target_descriptors is None:
+        raise ValueError("Insufficient field features for temporal registration")
+    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(source_descriptors, target_descriptors, k=2)
+    matches = [first for first, second in pairs if first.distance < .72 * second.distance]
+    if len(matches) < 12:
+        raise ValueError("Insufficient stable features for temporal registration")
+    source_points = np.float32([source_keys[item.queryIdx].pt for item in matches])
+    target_points = np.float32([target_keys[item.trainIdx].pt for item in matches])
+    motion, mask = cv2.findHomography(source_points, target_points, cv2.RANSAC, 3.0)
+    if motion is None or mask is None or float(mask.mean()) < .35:
+        raise ValueError("Temporal field transform was inconsistent")
+    image = cv2.perspectiveTransform(
+        np.asarray(registration.image_points, np.float32).reshape(-1, 1, 2), motion).reshape(-1, 2)
+    calibration = estimate_homography(image, registration.field_points)
+    inlier_ratio = float(mask.mean())
+    confidence = registration.confidence * (.75 + .25 * inlier_ratio)
+    diagnostics = {**registration.diagnostics, "propagated": True,
+                   "temporal_matches": len(matches), "temporal_inlier_ratio": inlier_ratio}
+    return Registration(image.tolist(), registration.field_points, calibration.matrix,
+                        confidence, registration.absolute_x, diagnostics)
+
+
 def _read_frame(capture: cv2.VideoCapture, timestamp: float) -> np.ndarray:
     capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
     ok, frame = capture.read()
@@ -255,6 +285,8 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
         raise ValueError(f"Could not open {clip['video_path']}")
     payload = {"keyframes": []}
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    previous_frame = None
+    previous_registration = None
     try:
         for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
             selected = None
@@ -271,9 +303,18 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                     errors.append(f"{candidate_time:.2f}s: unanchored/{candidate.confidence:.2f}")
                 except ValueError as error:
                     errors.append(f"{candidate_time:.2f}s: {error}")
+            if selected is None and previous_frame is not None and previous_registration is not None:
+                candidate_time = sample_time
+                frame = _read_frame(capture, candidate_time)
+                try:
+                    registration = propagate_registration(previous_frame, frame, previous_registration)
+                    selected = (candidate_time, frame, registration)
+                except ValueError as error:
+                    errors.append(f"temporal propagation: {error}")
             if selected is None:
                 raise ValueError("Automatic registration failed near keyframe: " + "; ".join(errors))
             candidate_time, frame, registration = selected
+            previous_frame, previous_registration = frame, registration
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
