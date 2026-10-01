@@ -16,10 +16,11 @@ function currentRows() {
 function drawOverlay(rows) {
   const c=$('overlay'), v=$('film'), x=c.getContext('2d'); c.width=v.videoWidth||1280; c.height=v.videoHeight||720; x.clearRect(0,0,c.width,c.height);
   for(const r of rows){
-    if(r.bbox_x1==null) continue;
+    const x1=r.bbox_x1??r.x1, y1=r.bbox_y1??r.y1, x2=r.bbox_x2??r.x2, y2=r.bbox_y2??r.y2;
+    if(x1==null) continue;
     x.strokeStyle=r.team==='team_0'?'#67d5ff':'#ffd166'; x.lineWidth=3;
-    x.strokeRect(Number(r.bbox_x1),Number(r.bbox_y1),Number(r.bbox_x2-r.bbox_x1),Number(r.bbox_y2-r.bbox_y1));
-    x.fillStyle=x.strokeStyle;x.font='16px system-ui';x.fillText(String(r.track_id||''),Number(r.bbox_x1),Math.max(16,Number(r.bbox_y1)-4));
+    x.strokeRect(Number(x1),Number(y1),Number(x2-x1),Number(y2-y1));
+    x.fillStyle=x.strokeStyle;x.font='16px system-ui';x.fillText(String(r.track_id||''),Number(x1),Math.max(16,Number(y1)-4));
   }
 }
 function draw() {
