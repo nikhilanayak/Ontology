@@ -246,7 +246,7 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
     if not clip:
         raise ValueError(f"No camera shot found: {clip_id}")
     duration = float(clip["end_s"] - clip["start_s"])
-    fractions = (.04, .5, .96) if duration >= 4 else (.05, .95)
+    fractions = (.15, .5, .85) if duration >= 4 else (.2, .8)
     sample_times = [float(clip["start_s"]) + duration * fraction for fraction in fractions]
     stored_times = [float(clip["start_s"]) + duration * index / (len(sample_times) - 1)
                     for index in range(len(sample_times))]
@@ -257,12 +257,23 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     try:
         for index, (sample_time, stored_time) in enumerate(zip(sample_times, stored_times)):
-            frame = _read_frame(capture, sample_time)
-            registration = register_field(frame, reader=reader)
-            if not registration.absolute_x:
-                raise ValueError(f"OCR could not anchor the yard-line identities at {sample_time:.2f}s")
-            if registration.confidence < .5:
-                raise ValueError(f"Automatic field registration was low confidence ({registration.confidence:.2f})")
+            selected = None
+            errors = []
+            for offset in (0, -.5, .5, -1.0, 1.0):
+                candidate_time = min(float(clip["end_s"]) - .1,
+                                     max(float(clip["start_s"]) + .1, sample_time + offset))
+                try:
+                    candidate_frame = _read_frame(capture, candidate_time)
+                    candidate = register_field(candidate_frame, reader=reader)
+                    if candidate.absolute_x and candidate.confidence >= .5:
+                        selected = (candidate_time, candidate_frame, candidate)
+                        break
+                    errors.append(f"{candidate_time:.2f}s: unanchored/{candidate.confidence:.2f}")
+                except ValueError as error:
+                    errors.append(f"{candidate_time:.2f}s: {error}")
+            if selected is None:
+                raise ValueError("Automatic registration failed near keyframe: " + "; ".join(errors))
+            candidate_time, frame, registration = selected
             output = diagnostics_dir / f"{clip_id.replace(':', '_')}-{index}.jpg"
             cv2.imwrite(str(output), diagnostic_image(frame, registration))
             payload["keyframes"].append({
@@ -272,6 +283,7 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                 "source": "automatic_lines_ocr_v1",
                 "registration_confidence": registration.confidence,
                 "registration_diagnostics": registration.diagnostics,
+                "sample_timestamp_s": candidate_time,
                 "diagnostic_image": str(output.resolve()),
             })
     finally:
