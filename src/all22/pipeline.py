@@ -7,7 +7,7 @@ from typing import Iterable, List
 from .alignment import align_monotonic, group_angle_sources
 from .db import connect, transaction
 from .models import Angle, Clip, PlayByPlay
-from .video import analyze_clips, coalesce_short_fragments, probe, source_cut_candidates
+from .video import camera_compensated_motion, clips_from_motion_scan, probe
 
 
 def register_game(db_path: Path, game_id: str, video_path: Path, season: int = None,
@@ -32,8 +32,12 @@ def segment_game(db_path: Path, game_id: str, sample_fps: float = 4.0,
     if not row:
         raise ValueError(f"Game {game_id} is not registered")
     path = Path(row["video_path"])
-    cuts = source_cut_candidates(path, sample_fps, scene_threshold)
-    clips = coalesce_short_fragments(analyze_clips(path, game_id, cuts))
+    # One continuous scan detects true source edits and action inside each
+    # source. The legacy scene-cut pipeline could merge the end of one source
+    # with the following play and then selected the first motion it observed.
+    motion_fps = max(5.0, sample_fps)
+    samples = camera_compensated_motion(path, motion_fps)
+    clips = clips_from_motion_scan(path, game_id, samples, motion_fps)
     with transaction(db_path) as connection:
         connection.execute("DELETE FROM clips WHERE game_id=?", (game_id,))
         connection.executemany(

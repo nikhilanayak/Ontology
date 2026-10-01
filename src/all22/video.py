@@ -211,6 +211,79 @@ def action_windows_from_motion(samples: List[MotionSample], sample_fps: float = 
     return windows
 
 
+def clips_from_motion_scan(path: Path, game_id: str, samples: List[MotionSample],
+                           sample_fps: float = 5.0) -> List[Clip]:
+    """Build camera sources and their live-action bounds from one full scan.
+
+    A source is bounded by a genuine visual edit. Motion is then interpreted
+    *within* that source, so the tail of the preceding angle cannot be joined
+    to the next angle merely because both contain moving players.
+    """
+    info = probe(path)
+    cuts: List[float] = []
+    for sample in samples:
+        if sample.camera_cut and (not cuts or sample.timestamp - cuts[-1] >= 1.5):
+            cuts.append(sample.timestamp)
+    boundaries = [0.0] + [value for value in cuts if 0 < value < info.duration] + [info.duration]
+    usable = np.asarray([sample.score for sample in samples if not sample.camera_cut], dtype=float)
+    activity_threshold = max(20.0, float(np.percentile(usable, 60))) if usable.size else 20.0
+    minimum_run = max(2, round(sample_fps * .6))
+    maximum_gap = max(1, round(sample_fps * 2.0))
+    clips: List[Clip] = []
+
+    for source_start, source_end in zip(boundaries, boundaries[1:]):
+        if source_end - source_start < 3.0:
+            continue
+        source_samples = [sample for sample in samples
+                          if source_start < sample.timestamp < source_end and not sample.camera_cut]
+        snap = play_end = None
+        confidence = 0.0
+        angle = Angle.NON_PLAY
+        if len(source_samples) >= 10:
+            scores = np.asarray([sample.score for sample in source_samples], dtype=float)
+            smoothed = np.convolve(scores, np.ones(5) / 5, mode="same")
+            active = smoothed >= activity_threshold
+            # Close brief tracking/camera-stabilization gaps, but never cross
+            # the source boundary established by a hard edit.
+            for index in range(1, len(active) - 1):
+                if active[index]:
+                    continue
+                left = next((offset for offset in range(1, maximum_gap + 1)
+                             if index - offset >= 0 and active[index - offset]), None)
+                right = next((offset for offset in range(1, maximum_gap + 1)
+                              if index + offset < len(active) and active[index + offset]), None)
+                if left is not None and right is not None:
+                    active[index] = True
+            runs = []
+            index = 0
+            while index < len(active):
+                if not active[index]:
+                    index += 1
+                    continue
+                stop = index + 1
+                while stop < len(active) and active[stop]:
+                    stop += 1
+                if stop - index >= minimum_run:
+                    energy = float(smoothed[index:stop].sum())
+                    runs.append((energy, index, stop))
+                index = stop
+            if runs:
+                _, first, stop = max(runs)
+                snap = max(source_start, source_samples[first].timestamp - .6)
+                play_end = min(source_end, source_samples[stop - 1].timestamp + .8)
+                if play_end - snap >= 1.5:
+                    peak = float(smoothed[first:stop].max())
+                    confidence = min(1.0, max(0.0, peak / max(activity_threshold * 3, 1.0)))
+                    angle, angle_confidence = classify_angle(frame_at(path, (snap + play_end) / 2))
+                    confidence = min(confidence, max(.05, angle_confidence))
+                else:
+                    snap = play_end = None
+        clip_id = f"{game_id}:{len(clips) + 1:04d}"
+        clips.append(Clip(game_id, clip_id, angle, source_start, source_end,
+                          snap, play_end, confidence))
+    return clips
+
+
 def visual_cut_candidates(path: Path, sample_fps: float = 2.0, threshold: float = 0.48) -> List[float]:
     """Return high-confidence hard-cut candidates using HSV histogram distance."""
     cuts: List[float] = []
