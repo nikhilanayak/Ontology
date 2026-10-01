@@ -43,5 +43,9 @@ The GPU stack is installed separately from the base application so a CUDA wheel
 can be selected for the host's NVIDIA driver. Verify it with:
 
 ```bash
-.venv/bin/python -c 'import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)'
+./scripts/bootstrap-gpu.sh
 ```
+
+The production host currently uses the pinned PyTorch 2.5.1 CUDA 12.1 wheel,
+which is compatible with its NVIDIA 535 driver. The script ends with a real
+CUDA matrix-multiplication smoke test rather than checking imports alone.
