@@ -90,6 +90,7 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
     samples: List[MotionSample] = []
     previous = None
     previous_histogram = None
+    previous_feature_mask = None
     frame_bytes = width * height * 3
     frame_index = 0
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
@@ -103,14 +104,20 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             timestamp = start_s + frame_index / sample_fps
             frame_index += 1
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            feature_mask = cv2.inRange(hsv, (25, 30, 20), (105, 255, 255))
             histogram = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
             cv2.normalize(histogram, histogram)
             if previous is None:
                 previous = gray
                 previous_histogram = histogram
+                previous_feature_mask = feature_mask
                 continue
-            points = cv2.goodFeaturesToTrack(previous, maxCorners=400, qualityLevel=.01,
-                                             minDistance=4, blockSize=5)
+            # Estimate camera motion from turf features. Using unrestricted
+            # corners lets the moving players dominate a static wide shot and
+            # can literally stabilize away the play we are trying to detect.
+            points = cv2.goodFeaturesToTrack(previous, maxCorners=400, qualityLevel=.005,
+                                             minDistance=4, blockSize=5,
+                                             mask=previous_feature_mask)
             matrix = None
             inlier_ratio = 0.0
             if points is not None and len(points) >= 12:
@@ -143,6 +150,7 @@ def camera_compensated_motion(path: Path, sample_fps: float = 5.0, start_s: floa
             samples.append(MotionSample(timestamp, 0.0 if camera_cut else raw_score, camera_cut))
             previous = gray
             previous_histogram = histogram
+            previous_feature_mask = feature_mask
     finally:
         process.stdout.close()
         stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr else ""
