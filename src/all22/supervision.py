@@ -85,7 +85,7 @@ def create_pair(db_path: Path, manifest: Path, output_dir: Path, game_id: str, p
 
 def _trajectory_errors(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
                        bdb_snap_frame: int, offset_s: float, flip_x: bool,
-                       flip_y: bool) -> tuple[list[float], int, int]:
+                       flip_y: bool, shift_x: float = 0.0) -> tuple[list[float], int, int]:
     answers = {int(frame_id): group[["x", "y"]].to_numpy(float)
                for frame_id, group in truth.groupby("frame_id")}
     errors: list[float] = []
@@ -100,12 +100,33 @@ def _trajectory_errors(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
             predicted[:, 0] = 120.0 - predicted[:, 0]
         if flip_y:
             predicted[:, 1] = 160.0 / 3.0 - predicted[:, 1]
+        predicted[:, 0] += shift_x
         distances = np.linalg.norm(actual[:, None, :] - predicted[None, :, :], axis=2)
         answer_index, prediction_index = linear_sum_assignment(distances)
         errors.extend(distances[answer_index, prediction_index].tolist())
         matched += len(answer_index)
         possible += len(actual)
     return errors, matched, possible
+
+
+def _five_yard_x_correction(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+                            bdb_snap_frame: int, offset_s: float, flip_x: bool) -> float:
+    timestamps = tracks.video_timestamp.drop_duplicates().to_numpy(float)
+    if not len(timestamps):
+        return 0.0
+    # offset maps video time to BDB time, so this is the video frame aligned to
+    # the tagged BDB snap.  Restrict the correction to repeated five-yard-line
+    # ambiguity; do not fit a free transform to the answers.
+    target = video_snap_s - offset_s
+    timestamp = float(timestamps[np.argmin(abs(timestamps - target))])
+    predicted = tracks[tracks.video_timestamp == timestamp].field_x.to_numpy(float)
+    actual = truth[truth.frame_id == bdb_snap_frame].x.to_numpy(float)
+    if not len(predicted) or not len(actual):
+        return 0.0
+    if flip_x:
+        predicted = 120.0 - predicted
+    delta = float(np.median(actual) - np.median(predicted))
+    return float(np.clip(round(delta / 5.0) * 5.0, -50.0, 50.0))
 
 
 def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> dict:
@@ -168,9 +189,12 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
             for offset in np.arange(-1.5, 1.501, .2):
                 for flip_x in (False, True):
                     for flip_y in (False, True):
+                        shift_x = _five_yard_x_correction(
+                            window, truth, float(selected["snap_s"]), bdb_snap,
+                            float(offset), flip_x)
                         errors, matched, possible = _trajectory_errors(
                             window, truth, float(selected["snap_s"]), bdb_snap,
-                            float(offset), flip_x, flip_y)
+                            float(offset), flip_x, flip_y, shift_x)
                         if errors:
                             score = float(np.median(errors)) + 2 * (1 - matched / max(possible, 1))
                             searches.append((score, float(offset), flip_x, flip_y))
@@ -179,16 +203,21 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
             _, coarse_offset, flip_x, flip_y = min(searches)
             refined = []
             for offset in np.arange(coarse_offset - .2, coarse_offset + .201, .05):
+                candidate_shift = _five_yard_x_correction(
+                    window, truth, float(selected["snap_s"]), bdb_snap,
+                    float(offset), flip_x)
                 errors, matched, possible = _trajectory_errors(
                     window, truth, float(selected["snap_s"]), bdb_snap,
-                    float(offset), flip_x, flip_y)
+                    float(offset), flip_x, flip_y, candidate_shift)
                 if errors:
-                    refined.append((float(np.median(errors)), float(offset), errors, matched, possible))
-            median, offset, errors, matched, possible = min(refined)
+                    refined.append((float(np.median(errors)), float(offset), candidate_shift,
+                                    errors, matched, possible))
+            median, offset, shift_x, errors, matched, possible = min(refined)
             results.append({
                 "clip_id": clip_id, "bdb_play_id": play_id, "action_id": selected["action_id"],
                 "candidate_actions": len(candidates), "selection_cost": float(selection_cost),
                 "snap_adjustment_s": offset, "flip_x": flip_x, "flip_y": flip_y,
+                "yard_line_translation_x": shift_x,
                 "matched_player_frames": matched, "possible_player_frames": possible,
                 "player_coverage": matched / max(possible, 1),
                 "median_error_yards": median, "p90_error_yards": float(np.percentile(errors, 90)),
