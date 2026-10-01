@@ -172,7 +172,7 @@ class FieldTrack:
 
 
 class FieldSpaceTracker:
-    def __init__(self, maximum_missed: int = 8, maximum_speed_yps: float = 15.0):
+    def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0):
         self.maximum_missed = maximum_missed
         self.maximum_speed_yps = maximum_speed_yps
         self.active: list[FieldTrack] = []
@@ -244,6 +244,14 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         value["interpolated"] = False
         parts.append(value)
     result = pd.concat(parts, ignore_index=True)
+    total_frames = max(1, int(result.video_timestamp.nunique()))
+    observations = result.groupby("track_id").size()
+    coverage = (observations / total_frames).clip(upper=1)
+    result["track_observations"] = result.track_id.map(observations).astype(int)
+    result["track_coverage"] = result.track_id.map(coverage).astype(float)
+    # Keep short tracklets in the artifact for diagnosis, but mark the durable
+    # trajectories that should drive action discovery and the tactical map.
+    result["track_reliable"] = result.track_coverage >= .35
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output, index=False)
     with transaction(db_path) as connection:
@@ -252,7 +260,9 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
             "INSERT INTO artifacts(game_id,clip_id,kind,path,metadata_json) VALUES(?,?,?,?,?)",
             (game_id, clip_id, "clip_tracks", str(output.resolve()),
              json.dumps({"rows": len(result), "tracks": int(result.track_id.nunique()),
+                         "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
                          "team_labeled_fraction": float((result.team != 'unknown').mean())})),
         )
     return {"rows": len(result), "tracks": int(result.track_id.nunique()),
+            "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
             "team_labeled_fraction": float((result.team != "unknown").mean())}
