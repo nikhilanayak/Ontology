@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "all22-reconstruction"
+version = "0.1.0"
+description = "BDB-supervised reconstruction of NFL All-22 film"
+requires-python = ">=3.9"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "fastapi>=0.115,<1",
+  "lxml>=5,<7",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+  "pandas>=2.2,<3",
+  "pyarrow>=17,<21",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+training = [
+  "torch>=2.4,<3",
+  "torchvision>=0.19,<1",
+  "transformers>=4.45,<5",
+]
+dev = ["httpx>=0.27,<1", "pytest>=8,<9"]
+
+[project.scripts]
+all22 = "all22.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

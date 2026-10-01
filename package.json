@@ -1,0 +1,20 @@
+{
+  "name": "nfl-all22-url-collector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "fetch:pfr": "node fetch-pfr.mjs",
+    "cv:test": "PYTHONPYCACHEPREFIX=/private/tmp/all22-pycache .venv/bin/pytest -q",
+    "cv:serve": "PYTHONPYCACHEPREFIX=/private/tmp/all22-pycache .venv/bin/all22 serve",
+    "batch:cdp": "node batch-cdp.mjs",
+    "batch:chrome": "node batch-chrome.mjs",
+    "capture:chrome": "node capture-chrome.mjs",
+    "download:m3u8": "node download-m3u8.mjs",
+    "collect": "node collect-all22.mjs",
+    "login": "node login-nfl.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}
