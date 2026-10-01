@@ -52,7 +52,10 @@ def _merge_family(segments: np.ndarray, angle: float, mask: np.ndarray) -> list[
     normal = np.asarray([-tangent[1], tangent[0]])
     groups: list[list[np.ndarray]] = []
     centers: list[float] = []
-    threshold = max(8.0, .009 * np.hypot(*mask.shape))
+    # Hough returns both painted edges and fragments split by players. They can
+    # be tens of pixels apart in HD All-22 while adjacent five-yard lines are
+    # much farther apart, so merge on a field-scale tolerance.
+    threshold = max(12.0, .03 * np.hypot(*mask.shape))
     for segment in sorted(segments, key=lambda value: float(np.dot(value.reshape(2, 2).mean(axis=0), normal))):
         points = segment.reshape(2, 2).astype(float)
         coordinate = float(np.dot(points.mean(axis=0), normal))
@@ -142,7 +145,7 @@ def read_field_numbers(frame: np.ndarray, reader=None) -> list[OCRNumber]:
             if label in digits or label[::-1] in digits:
                 number = candidate
                 break
-        if number is None or float(confidence) < .2:
+        if number is None or float(confidence) < .55:
             continue
         center = np.asarray(polygon, dtype=float).mean(axis=0)
         values.append(OCRNumber(number, (float(center[0]), float(center[1])), float(confidence)))
