@@ -89,7 +89,9 @@ def detect_yard_lines(frame: np.ndarray) -> tuple[list[np.ndarray], np.ndarray, 
     white = ((gray > 145) & (hsv[:, :, 1] < 115) & (mask > 0)).astype(np.uint8) * 255
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     edges = cv2.Canny(white, 50, 150)
-    minimum = max(45, int(min(frame.shape[:2]) * .16))
+    # Full five-yard lines span most of the visible field depth. A stricter
+    # length floor excludes strokes from numerals, arrows, and hash marks.
+    minimum = max(60, int(min(frame.shape[:2]) * .30))
     raw = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=45,
                           minLineLength=minimum, maxLineGap=35)
     if raw is None:
@@ -104,8 +106,8 @@ def detect_yard_lines(frame: np.ndarray) -> tuple[list[np.ndarray], np.ndarray, 
         keep = np.asarray([_angle_distance(value, angle) < np.deg2rad(8) for value in angles])
         family = _merge_family(segments[keep], float(angle), mask)
         if len(family) >= 2:
-            lengths = [np.linalg.norm(line[1] - line[0]) for line in family]
-            candidates.append((len(family) * np.median(lengths), family))
+            observed_lengths = np.linalg.norm(vectors[keep], axis=1)
+            candidates.append((len(family) ** 2 * np.median(observed_lengths), family))
     if not candidates:
         raise ValueError("Painted lines could not be grouped into a yard-line family")
     lines = max(candidates, key=lambda value: value[0])[1]
@@ -199,11 +201,17 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
         spacing_cv = float(np.std(spacing) / max(abs(np.mean(spacing)), 1e-9))
     else:
         spacing_cv = 1.0
-    confidence = float(np.clip(.25 + .08 * min(len(lines), 6) + .2 * absolute - .2 * min(spacing_cv, 1), 0, 1))
+    geometric_ok = (calibration.inlier_ratio >= .65 and calibration.median_error_yards <= 1.5
+                    and calibration.p95_error_yards <= 4.0)
+    confidence = float(np.clip(.25 + .08 * min(len(lines), 6) + .2 * absolute
+                               - .2 * min(spacing_cv, 1), 0, 1)) if geometric_ok else 0.0
     diagnostics = {"line_count": len(lines), "ocr_numbers": len(recognized),
                    "ocr_assignment_error": ocr_error, "spacing_cv": spacing_cv,
                    "absolute_x": absolute, "field_fraction": float((mask > 0).mean()),
-                   "white_fraction": float((white > 0).mean())}
+                   "white_fraction": float((white > 0).mean()),
+                   "inlier_ratio": calibration.inlier_ratio,
+                   "median_error_yards": calibration.median_error_yards,
+                   "p95_error_yards": calibration.p95_error_yards}
     return Registration(image_points, field_points, calibration.matrix, confidence, absolute, diagnostics)
 
 
