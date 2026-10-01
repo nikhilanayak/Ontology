@@ -46,3 +46,19 @@ def test_registration_propagates_through_camera_motion():
     actual = project_points(propagated.matrix, [[400, 250]])[0]
     assert np.allclose(actual, expected, atol=.5)
     assert propagated.diagnostics["temporal_inlier_ratio"] > .5
+
+
+def test_automatic_registration_does_not_anchor_from_one_jersey_number():
+    frame = np.zeros((600, 1100, 3), np.uint8)
+    frame[:] = (35, 115, 45)
+    for x in range(150, 951, 100):
+        cv2.line(frame, (x, 40), (x, 560), (245, 245, 245), 8)
+
+    class Reader:
+        def readtext(self, *_args, **_kwargs):
+            return [([[490, 250], [530, 250], [530, 290], [490, 290]], "50", .99)]
+
+    registration = register_field(frame, reader=Reader())
+    assert not registration.absolute_x
+    assert registration.diagnostics["ocr_numbers_raw"] == 1
+    assert registration.diagnostics["ocr_numbers"] == 0

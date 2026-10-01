@@ -152,6 +152,25 @@ def read_field_numbers(frame: np.ndarray, reader=None) -> list[OCRNumber]:
     return values
 
 
+def _credible_field_numbers(numbers: list[OCRNumber], frame_shape: tuple[int, ...]) -> bool:
+    """Reject isolated jersey digits before they can anchor the field template."""
+    if len(numbers) < 2:
+        return False
+    height, width = frame_shape[:2]
+    by_value: dict[int, list[OCRNumber]] = {}
+    for number in numbers:
+        by_value.setdefault(number.value, []).append(number)
+    # Painted values normally repeat on the two number rows.  Their large
+    # transverse separation is much stronger evidence than OCR confidence.
+    for values in by_value.values():
+        for first, second in itertools.combinations(values, 2):
+            if np.hypot(first.center[0] - second.center[0], first.center[1] - second.center[1]) >= .28 * min(height, width):
+                return True
+    # A partially cropped view may show only one row, but require a sequence of
+    # at least three labels with two distinct legal values.
+    return len(numbers) >= 3 and len(by_value) >= 2
+
+
 def _assign_field_x(lines: list[np.ndarray], numbers: list[OCRNumber]) -> tuple[np.ndarray, bool, float]:
     direction = lines[0][1] - lines[0][0]
     direction /= np.linalg.norm(direction)
@@ -188,7 +207,8 @@ def _assign_field_x(lines: list[np.ndarray], numbers: list[OCRNumber]) -> tuple[
 
 def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNumber]] = None) -> Registration:
     lines, mask, white = detect_yard_lines(frame)
-    recognized = numbers if numbers is not None else read_field_numbers(frame, reader)
+    raw_recognized = numbers if numbers is not None else read_field_numbers(frame, reader)
+    recognized = raw_recognized if numbers is not None or _credible_field_numbers(raw_recognized, frame.shape) else []
     field_x, absolute, ocr_error = _assign_field_x(lines, recognized)
     image_points = []
     field_points = []
@@ -212,6 +232,7 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
     confidence = float(np.clip(.25 + .08 * min(len(lines), 6) + .2 * absolute
                                - .2 * min(spacing_cv, 1), 0, 1)) if geometric_ok else 0.0
     diagnostics = {"line_count": len(lines), "ocr_numbers": len(recognized),
+                   "ocr_numbers_raw": len(raw_recognized),
                    "ocr_assignment_error": ocr_error, "spacing_cv": spacing_cv,
                    "absolute_x": absolute, "field_fraction": float((mask > 0).mean()),
                    "white_fraction": float((white > 0).mean()),
