@@ -157,23 +157,28 @@ def _sideline_interior_mask(frame: np.ndarray, field_mask: np.ndarray) -> Option
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     white = ((gray > 155) & (hsv[:, :, 1] < 105) & (field_mask > 0)).astype(np.uint8) * 255
     edges = cv2.Canny(white, 50, 150)
-    minimum = max(50, int(width * .28))
-    raw = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=max(35, int(width * .025)),
-                          minLineLength=minimum, maxLineGap=max(25, int(width * .025)))
+    try:
+        # Yard lines are the repeated line family. Sidelines belong to the
+        # other dominant orientation, regardless of camera angle.
+        from .field_registration import detect_yard_lines
+        yard_lines, _, _ = detect_yard_lines(frame)
+        yard_vector = yard_lines[0][1] - yard_lines[0][0]
+        yard_angle = float(np.mod(np.arctan2(yard_vector[1], yard_vector[0]), np.pi))
+    except ValueError:
+        return None
+    raw = cv2.HoughLines(edges, 1, np.pi / 720, threshold=max(80, int(width * .09)))
     if raw is None:
         return None
     candidates = []
-    for x1, y1, x2, y2 in raw[:, 0, :]:
-        vector = np.asarray([x2 - x1, y2 - y1], dtype=float)
-        length = float(np.linalg.norm(vector))
-        if length < minimum:
+    for rank, (rho, theta) in enumerate(raw[:1200, 0, :]):
+        line_angle = float(np.mod(theta + np.pi / 2, np.pi))
+        angle_from_yard = abs(((line_angle - yard_angle + np.pi / 2) % np.pi) - np.pi / 2)
+        if angle_from_yard < np.deg2rad(20):
             continue
-        tangent = vector / length
-        if tangent[0] < 0:
-            tangent *= -1
-        normal = np.asarray([-tangent[1], tangent[0]])
-        point = np.asarray([(x1 + x2) / 2, (y1 + y2) / 2], dtype=float)
-        candidates.append((point, tangent, normal, length))
+        normal = np.asarray([np.cos(theta), np.sin(theta)], dtype=float)
+        tangent = np.asarray([-normal[1], normal[0]], dtype=float)
+        point = float(rho) * normal
+        candidates.append((point, tangent, normal, float(rho), rank))
     if len(candidates) < 2:
         return None
     center = np.asarray([width / 2, height / 2], dtype=float)
@@ -188,7 +193,9 @@ def _sideline_interior_mask(frame: np.ndarray, field_mask: np.ndarray) -> Option
             separation = abs(float((second[0] - first[0]) @ first[2]))
             if separation < .32 * height:
                 continue
-            score = separation * min(first[3], second[3])
+            # Hough output is vote ordered. Prefer a widely separated pair of
+            # strongly supported lines over late text/logo artifacts.
+            score = separation - .5 * (first[4] + second[4])
             if best is None or score > best[0]:
                 best = (score, first, second)
     if best is None:
@@ -197,7 +204,7 @@ def _sideline_interior_mask(frame: np.ndarray, field_mask: np.ndarray) -> Option
     yy, xx = np.indices((height, width), dtype=float)
     points = np.stack([xx, yy], axis=-1)
     inside = np.ones((height, width), dtype=bool)
-    for point, _, normal, _ in (first, second):
+    for point, _, normal, _, _ in (first, second):
         center_sign = float((center - point) @ normal)
         if abs(center_sign) < 1:
             return None
