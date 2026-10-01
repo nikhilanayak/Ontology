@@ -8,8 +8,21 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
-from .db import connect
+from .db import connect, transaction
+
+
+class AuditUpdate(BaseModel):
+    mapping_correct: bool
+    sources_correct: bool
+    timing_correct: bool
+    notes: str = ""
+
+
+class SourceTimingUpdate(BaseModel):
+    snap_s: float
+    play_end_s: float
 
 
 def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path] = None) -> FastAPI:
@@ -30,10 +43,12 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
         with connect(db_path) as connection:
             rows = connection.execute(
                 """SELECT p.*, a.play_id, a.status AS alignment_status, q.status AS quality_status,
-                          q.reasons_json, q.metrics_json
+                          q.reasons_json, q.metrics_json, aa.selected AS audit_selected,
+                          aa.mapping_correct,aa.sources_correct,aa.timing_correct,aa.notes AS audit_notes
                    FROM pbp_plays p
                    LEFT JOIN play_alignments a ON a.game_id=p.game_id AND a.pbp_ordinal=p.ordinal
                    LEFT JOIN quality_reports q ON q.play_id=a.play_id
+                   LEFT JOIN alignment_audits aa ON aa.play_id=a.play_id
                    WHERE p.game_id=? AND p.eligible=1 ORDER BY p.ordinal""", (game_id,),
             ).fetchall()
             source_rows = connection.execute(
@@ -64,8 +79,45 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
                 value["processing_status"] = value["quality_status"]
             value["reasons"] = reasons
             value["sources"] = sources_by_play.get(value["play_id"], [])
+            value["audit"] = {
+                "selected": bool(value.pop("audit_selected") or 0),
+                "mapping_correct": value.pop("mapping_correct"),
+                "sources_correct": value.pop("sources_correct"),
+                "timing_correct": value.pop("timing_correct"),
+                "notes": value.pop("audit_notes") or "",
+            }
             values.append(value)
         return values
+
+    @app.put("/api/plays/{play_id}/audit")
+    def save_audit(play_id: str, audit: AuditUpdate):
+        with transaction(db_path) as connection:
+            exists = connection.execute("SELECT 1 FROM play_alignments WHERE play_id=?", (play_id,)).fetchone()
+            if not exists:
+                raise HTTPException(404, "Play not found")
+            connection.execute(
+                """INSERT INTO alignment_audits
+                     (play_id,selected,mapping_correct,sources_correct,timing_correct,notes,reviewed_at)
+                   VALUES(?,1,?,?,?,?,CURRENT_TIMESTAMP)
+                   ON CONFLICT(play_id) DO UPDATE SET selected=1,
+                     mapping_correct=excluded.mapping_correct,sources_correct=excluded.sources_correct,
+                     timing_correct=excluded.timing_correct,notes=excluded.notes,reviewed_at=CURRENT_TIMESTAMP""",
+                (play_id, int(audit.mapping_correct), int(audit.sources_correct),
+                 int(audit.timing_correct), audit.notes.strip()),
+            )
+        return {"play_id": play_id, **audit.model_dump()}
+
+    @app.put("/api/clips/{clip_id}/timing")
+    def save_source_timing(clip_id: str, timing: SourceTimingUpdate):
+        with transaction(db_path) as connection:
+            clip = connection.execute("SELECT start_s,end_s FROM clips WHERE clip_id=?", (clip_id,)).fetchone()
+            if not clip:
+                raise HTTPException(404, "Source clip not found")
+            if not (clip["start_s"] <= timing.snap_s < timing.play_end_s <= clip["end_s"]):
+                raise HTTPException(422, "Timing must satisfy source start <= snap < play end <= source end")
+            connection.execute("UPDATE clips SET snap_s=?,play_end_s=? WHERE clip_id=?",
+                               (timing.snap_s, timing.play_end_s, clip_id))
+        return {"clip_id": clip_id, **timing.model_dump()}
 
     @app.get("/api/plays/{play_id}/sources")
     def play_sources(play_id: str):

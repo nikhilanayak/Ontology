@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import alignment, bdb, db, nflverse, pfr, supervision, video
+from . import alignment, bdb, db, nflverse, pfr, pilot, remote_download, supervision, tracking, video
 from . import pipeline
 
 
@@ -18,6 +18,9 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     commands.add_parser("init-db")
+    receive = commands.add_parser("receive-download")
+    receive.add_argument("--output-root", type=Path, default=ROOT / "downloads")
+    receive.add_argument("--metadata-root", type=Path, default=ROOT / "data" / "downloads")
     register = commands.add_parser("register-game")
     register.add_argument("--game-id", required=True)
     register.add_argument("--season", type=int)
@@ -26,6 +29,10 @@ def parser() -> argparse.ArgumentParser:
     register.add_argument("--away-team")
     register.add_argument("--pfr-url")
     register.add_argument("video", type=Path)
+    external = commands.add_parser("set-external-id")
+    external.add_argument("--game-id", required=True)
+    external.add_argument("--provider", required=True)
+    external.add_argument("--external-id", required=True)
     import_bdb = commands.add_parser("import-bdb")
     import_bdb.add_argument("files", type=Path, nargs="+")
 
@@ -62,6 +69,41 @@ def parser() -> argparse.ArgumentParser:
     align = commands.add_parser("align-game")
     align.add_argument("--game-id", required=True)
 
+    select_pilot = commands.add_parser("select-pilot-games")
+    select_pilot.add_argument("--games", type=Path, required=True)
+    select_pilot.add_argument("--plays", type=Path, required=True)
+    select_pilot.add_argument("--output", type=Path, default=ROOT / "data" / "pilot-games.json")
+
+    audit = commands.add_parser("create-audit-sample")
+    audit.add_argument("--game-id", required=True)
+    audit.add_argument("--count", type=int, default=40)
+    audit_summary = commands.add_parser("audit-summary")
+    audit_summary.add_argument("--game-id", required=True)
+
+    evaluate = commands.add_parser("evaluate-trajectories")
+    evaluate.add_argument("--game-id", required=True)
+    evaluate.add_argument("--predictions-dir", type=Path, default=ROOT / "data" / "trajectories")
+    evaluate.add_argument("--output", type=Path)
+
+    detect = commands.add_parser("detect-source")
+    detect.add_argument("--play-id", required=True)
+    detect.add_argument("--source-order", type=int, required=True)
+    detect.add_argument("--sample-hz", type=float, default=10.0)
+    detect.add_argument("--threshold", type=float, default=.35)
+    detect.add_argument("--device")
+    detect.add_argument("--output", type=Path, required=True)
+
+    project = commands.add_parser("project-source")
+    project.add_argument("--play-id", required=True)
+    project.add_argument("--source-order", type=int, required=True)
+    project.add_argument("--detections", type=Path, required=True)
+    project.add_argument("--landmarks", type=Path, required=True)
+    project.add_argument("--output", type=Path, required=True)
+
+    fuse = commands.add_parser("fuse-sources")
+    fuse.add_argument("--output", type=Path, required=True)
+    fuse.add_argument("inputs", type=Path, nargs="+")
+
     labels = commands.add_parser("export-bdb-play")
     labels.add_argument("--game-id", required=True)
     labels.add_argument("--play-id", required=True)
@@ -87,10 +129,16 @@ def main() -> None:
     db.initialize(args.db)
     if args.command == "init-db":
         print(args.db)
+    elif args.command == "receive-download":
+        job = remote_download.read_job()
+        print(json.dumps(remote_download.receive_job(job, args.output_root, args.metadata_root)))
     elif args.command == "register-game":
         pipeline.register_game(args.db, args.game_id, args.video, args.season, args.week,
                                args.home_team, args.away_team, args.pfr_url)
         print(json.dumps({"game_id": args.game_id, "video": str(args.video.resolve())}))
+    elif args.command == "set-external-id":
+        pilot.set_external_id(args.db, args.game_id, args.provider, args.external_id)
+        print(json.dumps({"game_id": args.game_id, "provider": args.provider, "external_id": args.external_id}))
     elif args.command == "import-bdb":
         print(json.dumps({"rows": bdb.import_tracking(args.db, args.files)}))
     elif args.command == "import-pfr":
@@ -140,6 +188,31 @@ def main() -> None:
         }, default=str, indent=2))
     elif args.command == "align-game":
         print(json.dumps({"alignments": pipeline.align_game(args.db, args.game_id)}))
+    elif args.command == "select-pilot-games":
+        values = pilot.select_pilot_games(args.games, args.plays, args.output)
+        print(json.dumps({"output": str(args.output), "games": values}, indent=2))
+    elif args.command == "create-audit-sample":
+        values = pilot.create_audit_sample(args.db, args.game_id, args.count)
+        print(json.dumps({"game_id": args.game_id, "selected": len(values), "play_ids": values}))
+    elif args.command == "audit-summary":
+        print(json.dumps(pilot.audit_summary(args.db, args.game_id), indent=2))
+    elif args.command == "evaluate-trajectories":
+        result = pilot.evaluate_trajectories(args.db, args.game_id, args.predictions_dir)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2))
+    elif args.command == "detect-source":
+        rows = tracking.detect_source(args.db, args.play_id, args.source_order, args.output,
+                                      args.sample_hz, args.threshold, args.device)
+        print(json.dumps({"rows": rows, "output": str(args.output)}))
+    elif args.command == "project-source":
+        result = tracking.project_source(args.db, args.play_id, args.source_order,
+                                         args.detections, args.landmarks, args.output)
+        print(json.dumps({**result, "output": str(args.output)}, indent=2))
+    elif args.command == "fuse-sources":
+        rows = tracking.fuse_sources(args.inputs, args.output)
+        print(json.dumps({"rows": rows, "output": str(args.output)}))
     elif args.command == "export-bdb-play":
         frame = supervision.bdb_play_dataframe(args.db, args.game_id, args.play_id)
         if frame.empty:

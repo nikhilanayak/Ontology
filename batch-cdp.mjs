@@ -17,7 +17,25 @@ function parseArgs() {
   const limit = limitAt >= 0 ? Number(values[limitAt + 1]) : 0;
   if (!Number.isInteger(year) || year < 2000 || year > 2100) throw new Error("Enter a valid season year.");
   if (limitAt >= 0 && (!Number.isInteger(limit) || limit < 1)) throw new Error("--limit requires a positive whole number.");
-  return { year, limit, headless: values.includes("--headless") };
+  const valueAfter = name => {
+    const index = values.indexOf(name);
+    return index >= 0 ? values[index + 1] : null;
+  };
+  const allAfter = name => values.flatMap((value, index) => value === name && values[index + 1] ? [values[index + 1]] : []);
+  const gameIds = allAfter("--game-id");
+  const gameUrls = allAfter("--game-url");
+  const remote = valueAfter("--remote");
+  const remoteRoot = valueAfter("--remote-root");
+  if (remote && !remoteRoot) throw new Error("--remote requires --remote-root.");
+  if (remoteRoot && !remote) throw new Error("--remote-root requires --remote.");
+  if (gameIds.some(id => !/^[a-z0-9][a-z0-9-]{2,119}$/.test(id))) throw new Error("Invalid --game-id slug.");
+  for (const url of gameUrls) {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || !parsed.hostname.endsWith("nfl.com") || !parsed.pathname.startsWith("/games/")) {
+      throw new Error(`Invalid NFL --game-url: ${url}`);
+    }
+  }
+  return { year, limit, headless: values.includes("--headless"), gameIds, gameUrls, remote, remoteRoot };
 }
 
 async function dismissOverlay(page) {
@@ -191,6 +209,46 @@ async function download(gameUrl, captured) {
   throw new Error("No matching All-22 manifest produced a valid video file.");
 }
 
+function parseRemote(value) {
+  const match = value.match(/^([^\s:]+(?:@[^\s:]+)?)(?::(\d+))?$/);
+  if (!match) throw new Error("--remote must look like user@host or user@host:port.");
+  return { destination: match[1], port: match[2] || "22" };
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
+async function remoteDownload(gameUrl, captured, options) {
+  const id = new URL(gameUrl).pathname.split("/").filter(Boolean).at(-1);
+  const remote = parseRemote(options.remote);
+  const command = [
+    `cd ${shellQuote(options.remoteRoot)}`,
+    "source scripts/production-env.sh",
+    ".venv/bin/all22 receive-download --output-root downloads --metadata-root data/downloads",
+  ].join(" && ");
+  const child = spawn("ssh", ["-p", remote.port, "-o", "BatchMode=yes", remote.destination, command], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", chunk => { stdout += chunk; });
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  child.stdin.end(JSON.stringify({
+    game_id: id,
+    expected_duration_s: captured.playerDuration,
+    manifests: captured.manifests,
+  }));
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+  if (code !== 0) throw new Error(`Remote download failed (${code}): ${stderr.trim().slice(-1500)}`);
+  const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+  const result = JSON.parse(lines.at(-1));
+  return `${result.path} (${result.width}x${result.height}, ${Math.round(result.duration_s / 60)} min)`;
+}
+
 async function main() {
   const options = parseArgs();
   const context = await chromium.launchPersistentContext(profile, {
@@ -212,7 +270,12 @@ async function main() {
   await cdp.send("Network.enable");
   await cdp.send("Network.setCacheDisabled", { cacheDisabled: true });
   try {
-    let games = await discoverSeason(page, options.year, options.limit);
+    let games = [
+      ...options.gameIds.map(id => `https://www.nfl.com/games/${id}`),
+      ...options.gameUrls,
+    ];
+    if (!games.length) games = await discoverSeason(page, options.year, options.limit);
+    games = [...new Set(games)];
     console.log(`Found ${games.length} games for ${options.year}.`);
     if (options.limit) games = games.slice(0, options.limit);
     console.log(`Processing ${games.length} game${games.length === 1 ? "" : "s"}.`);
@@ -222,7 +285,10 @@ async function main() {
       try {
         const captured = await captureAll22(page, cdp, game);
         console.log(`Verified All-22: ${Math.round(captured.playerDuration / 60)} minutes; NFL asset responses: ${captured.assets.length}.`);
-        console.log(`Saved: ${await download(game, captured)}`);
+        const saved = options.remote
+          ? await remoteDownload(game, captured, options)
+          : await download(game, captured);
+        console.log(`Saved: ${saved}`);
       } catch (error) {
         console.error(`Skipped ${id}: ${error.message}`);
       }

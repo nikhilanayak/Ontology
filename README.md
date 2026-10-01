@@ -3,9 +3,9 @@
 This repository has two connected systems:
 
 1. An authenticated Chrome/CDP downloader for NFL All-22 film.
-2. A BDB-supervised computer-vision pipeline that aligns film to PFR play-by-play and reconstructs player trajectories in field coordinates.
+2. A BDB-evaluated computer-vision pipeline that aligns film to nflverse play-by-play and reconstructs anonymous player trajectories in field coordinates.
 
-The reconstruction pipeline is deliberately fail-closed. A play is not published unless clip pairing, PFR alignment, field calibration, 22-player identity assignment, track coverage, and cross-angle agreement all pass their thresholds.
+The reconstruction pipeline is deliberately fail-closed. A play is not published unless source grouping, play alignment, field calibration, track coverage, and cross-angle agreement pass their thresholds.
 
 ## Install
 
@@ -28,7 +28,7 @@ Install the optional model-training stack only once paired BDB/video examples ar
 .venv/bin/pip install -e '.[training]'
 ```
 
-## Download verified All-22 film
+## Download verified All-22 film directly to production
 
 Log in once, then run the CDP collector. `--limit` stops both discovery and downloading after the requested number of games.
 
@@ -38,6 +38,41 @@ npm run batch:cdp -- 2025 --limit 1
 ```
 
 The collector requires the visible All-22 control, a 50+ minute player duration, a matching HLS playlist duration, and a valid video stream before saving.
+
+For the pilot, Chrome and the authenticated NFL profile remain local while
+ffmpeg runs directly on the production box. The signed manifest is sent only
+through SSH stdin and is never written to Git, command arguments, or metadata:
+
+```bash
+npm run batch:cdp -- 2022 \
+  --game-id bills-at-rams-2022-reg-1 --limit 1 \
+  --remote nikhil@50.39.98.5:2222 \
+  --remote-root /home/nikhil/fast/Ontology
+```
+
+The remote receiver allowlists HTTPS Lura manifests, chooses the largest video
+rendition, rejects non-video or short downloads, writes through a `.partial`
+file, and records only a sanitized manifest fingerprint. Start with BUF–LAR;
+do not acquire the remaining games until its alignment audit passes.
+
+## Prepare the 2022 BDB pilot
+
+First accept the [Big Data Bowl 2024 competition rules](https://www.kaggle.com/competitions/nfl-big-data-bowl-2024/rules)
+using the Kaggle account configured on the production box. Then run on the box:
+
+```bash
+cd /home/nikhil/fast/Ontology
+source scripts/production-env.sh
+python scripts/fetch-bdb-2024.py
+
+.venv/bin/all22 select-pilot-games \
+  --games data/raw/bdb-2024/games.csv \
+  --plays data/raw/bdb-2024/plays.csv
+.venv/bin/all22 import-bdb data/raw/bdb-2024/tracking_week_1.csv
+```
+
+The frozen pilot is BUF–LAR and PIT–CIN for development, followed by TB–DAL
+as the untouched evaluation game.
 
 ## Initialize and register a game
 
@@ -118,6 +153,69 @@ aligns those groups to every filmed nflverse event. Including punts, kickoffs,
 and field goals in the alignment prevents special teams from shifting all
 later scrimmage plays; the viewer still lists only eligible runs and passes.
 
+For each pilot game, connect its local slug to the numeric BDB ID emitted by
+`select-pilot-games`, then generate the deterministic, quarter/play-type
+balanced 40-play audit set:
+
+```bash
+.venv/bin/all22 set-external-id \
+  --game-id bills-at-rams-2022-reg-1 --provider bdb --external-id BDB_GAME_ID
+.venv/bin/all22 create-audit-sample \
+  --game-id bills-at-rams-2022-reg-1 --count 40
+.venv/bin/all22 audit-summary --game-id bills-at-rams-2022-reg-1
+```
+
+The viewer exposes audit controls and independent snap/end corrections for
+each source. Check the two presentations separately; extra fragments and
+missing angles are retained rather than forced into an exactly-two schema.
+The gate is at least 95% exact play mapping and at least 90% of audited plays
+with two correct source presentations.
+
+## Frozen detector/tracker baseline
+
+The pilot does **not** train an end-to-end recognition model. It runs a frozen
+Torchvision Faster R-CNN COCO person detector, associates boxes over time, and
+uses the bottom-center of each box as the player's contact point:
+
+```bash
+.venv/bin/all22 detect-source \
+  --play-id bills-at-rams-2022-reg-1:0001 --source-order 0 \
+  --device cuda --output data/detections/play-0001-sideline.parquet
+```
+
+Projection requires an audited snap timestamp and a landmark JSON file with at
+least four non-collinear image/field correspondences, in yards on the standard
+120 by 53.333 yard coordinate system:
+
+```json
+{
+  "image_points": [[310, 170], [1610, 180], [180, 900], [1740, 920]],
+  "field_points": [[40, 0], [60, 0], [40, 53.333], [60, 53.333]]
+}
+```
+
+```bash
+.venv/bin/all22 project-source \
+  --play-id bills-at-rams-2022-reg-1:0001 --source-order 0 \
+  --detections data/detections/play-0001-sideline.parquet \
+  --landmarks data/landmarks/play-0001-sideline.json \
+  --output data/projected/play-0001-sideline.parquet
+
+.venv/bin/all22 fuse-sources \
+  --output data/trajectories/bills-at-rams-2022-reg-1:0001.parquet \
+  data/projected/play-0001-sideline.parquet \
+  data/projected/play-0001-endzone.parquet
+
+.venv/bin/all22 evaluate-trajectories \
+  --game-id bills-at-rams-2022-reg-1 \
+  --output data/reports/buf-lar.json
+```
+
+The evaluator snap-aligns results to BDB, performs anonymous Hungarian
+matching, and reports median/p90 position error and player-frame coverage. The
+expansion target is median error at most 2 yards, p90 at most 5 yards, and at
+least 80% of BDB player-frames matched within 3 yards.
+
 ## Viewer
 
 ```bash
@@ -136,6 +234,11 @@ Tests cover PFR parsing, BDB schema aliases and snap normalization, monotonic al
 
 ## Current implementation boundary
 
-The data contracts, BDB answer ingestion, synchronization manifest, baseline video segmentation, alignment, calibration utilities, quality gates, API, and viewer are operational. The learned field-keypoint, RT-DETR, ByteTrack, jersey-OCR, and cross-angle fusion models require the matching BDB film and annotations before they can be trained; their training dataset interface is implemented in `src/all22/training.py`.
+The data contracts, direct-to-production acquisition, BDB ingestion, dual-source
+alignment/auditing, calibration utilities, frozen detector, deterministic box
+tracking, geometric fusion, evaluator, API, and viewer are operational.
+Automated field-keypoint detection, stronger tracking, team classification,
+and any targeted fine-tuning remain subsequent experiments; jersey OCR and
+player identity are explicitly outside this pilot.
 
 Keep NFL footage, browser profiles, signed URLs, BDB-derived artifacts, and reconstructed trajectories private and comply with the applicable source licenses and service terms.

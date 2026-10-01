@@ -39,6 +39,10 @@ and generated trajectories are deliberately excluded from Git. Transfer those
 artifacts separately into `downloads/` and `data/` after creating a backup and
 checking available disk space.
 
+For new film, do not transfer a local download. Run the local authenticated
+collector with `--remote` and `--remote-root /home/nikhil/fast/Ontology`; the
+signed manifest crosses SSH stdin and ffmpeg writes directly to the fast disk.
+
 The GPU stack is installed separately from the base application so a CUDA wheel
 can be selected for the host's NVIDIA driver. Verify it with:
 

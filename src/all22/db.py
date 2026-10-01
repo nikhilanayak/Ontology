@@ -104,6 +104,24 @@ CREATE TABLE IF NOT EXISTS artifacts (
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS game_external_ids (
+  game_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  PRIMARY KEY (game_id, provider),
+  UNIQUE (provider, external_id),
+  FOREIGN KEY (game_id) REFERENCES games(game_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS alignment_audits (
+  play_id TEXT PRIMARY KEY,
+  selected INTEGER NOT NULL DEFAULT 1,
+  mapping_correct INTEGER,
+  sources_correct INTEGER,
+  timing_correct INTEGER,
+  notes TEXT,
+  reviewed_at TEXT,
+  FOREIGN KEY (play_id) REFERENCES play_alignments(play_id) ON DELETE CASCADE
+);
 """
 
 

@@ -17,6 +17,21 @@
       <div class="summary"><h2 id="play-title">Select a play</h2><p id="play-detail"></p></div>
       <video id="film" controls preload="metadata"></video>
       <div id="sources" class="sources"></div>
+      <fieldset id="audit" hidden>
+        <legend>Alignment audit</legend>
+        <label><input id="audit-mapping" type="checkbox"> Correct play</label>
+        <label><input id="audit-sources" type="checkbox"> Correct source clips</label>
+        <label><input id="audit-timing" type="checkbox"> Correct snap/end timing</label>
+        <input id="audit-notes" type="text" placeholder="Notes (optional)">
+        <button id="audit-save">Save audit</button><span id="audit-status"></span>
+      </fieldset>
+      <fieldset id="timing" hidden>
+        <legend>Source timing correction</legend>
+        <select id="timing-source"></select>
+        <label>Snap (video seconds)<input id="timing-snap" type="number" step="0.01"></label>
+        <label>Play end<input id="timing-end" type="number" step="0.01"></label>
+        <button id="timing-save">Save timing</button><span id="timing-status"></span>
+      </fieldset>
       <canvas id="field" width="1200" height="533"></canvas>
       <div class="controls"><button id="play-animation">Play field animation</button><input id="timeline" type="range" min="0" max="0" value="0"><span id="clock">0.0s</span></div>
       <pre id="diagnostics"></pre>

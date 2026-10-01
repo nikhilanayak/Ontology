@@ -37,3 +37,16 @@ def test_game_and_static_endpoints(tmp_path: Path):
     assert plays[0]["processing_status"] == "awaiting_reconstruction"
     assert plays[0]["sources"][0]["angle"] == "sideline"
     assert client.get("/api/plays/p1/sources").json()[0]["start_s"] == 10
+    response = client.put("/api/plays/p1/audit", json={
+        "mapping_correct": True, "sources_correct": False,
+        "timing_correct": True, "notes": "extra replay",
+    })
+    assert response.status_code == 200
+    audit = client.get("/api/games/g/plays").json()[0]["audit"]
+    assert audit == {"selected": True, "mapping_correct": 1, "sources_correct": 0,
+                     "timing_correct": 1, "notes": "extra replay"}
+    response = client.put("/api/clips/c1/timing", json={"snap_s": 12.5, "play_end_s": 20.5})
+    assert response.status_code == 200
+    source = client.get("/api/plays/p1/sources").json()[0]
+    assert source["snap_s"] == 12.5
+    assert source["play_end_s"] == 20.5
