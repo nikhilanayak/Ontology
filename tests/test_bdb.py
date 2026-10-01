@@ -1,8 +1,11 @@
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from all22.bdb import import_tracking, play_signatures, snap_frame
 from all22.db import initialize
-from all22.supervision import bdb_play_dataframe
+from all22.supervision import bdb_play_dataframe, refine_with_bdb_tracks
 
 
 def test_bdb_aliases_and_snap(tmp_path: Path):
@@ -37,3 +40,21 @@ def test_bdb_play_signature_contains_answer_key_features(tmp_path: Path):
     assert signature.category == "pass"
     assert len(signature.speed_profile) == 8
     assert len(signature.formation) == 4
+
+
+def test_multiframe_bdb_refinement_generalizes_to_held_out_frames():
+    track_rows, truth_rows = [], []
+    points = np.asarray([[20, 8], [22, 16], [24, 24], [26, 32],
+                         [28, 40], [30, 12], [32, 28], [34, 44]], float)
+    for frame in range(10):
+        actual = points + [frame * .2, 0]
+        predicted = actual * [1.08, .9] + [5, -2]
+        for player, (guess, answer) in enumerate(zip(predicted, actual)):
+            track_rows.append({"video_timestamp": frame / 10, "track_id": player,
+                               "field_x": guess[0], "field_y": guess[1]})
+            truth_rows.append({"frame_id": frame + 5, "nfl_id": player,
+                               "x": answer[0], "y": answer[1]})
+    result = refine_with_bdb_tracks(pd.DataFrame(track_rows), pd.DataFrame(truth_rows),
+                                    0.0, 5, 0.0, False, False, 0.0)
+    assert result["fit_inliers"] >= 30
+    assert result["held_out_median_error_yards"] < .05

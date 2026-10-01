@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import re
 
+import cv2
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
@@ -129,6 +130,74 @@ def _five_yard_x_correction(tracks: pd.DataFrame, truth: pd.DataFrame, video_sna
     return float(np.clip(round(delta / 5.0) * 5.0, -50.0, 50.0))
 
 
+def refine_with_bdb_tracks(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+                           bdb_snap_frame: int, offset_s: float, flip_x: bool,
+                           flip_y: bool, shift_x: float) -> dict:
+    """Fit on alternating frames and score the correction on held-out frames.
+
+    This is an answer-key supervision stage, not an inference-time shortcut.
+    Anonymous players are assigned one-to-one at each frame, while one shared
+    projective correction must explain the entire action.
+    """
+    value = tracks.copy()
+    base = value[["field_x", "field_y"]].to_numpy(float)
+    if flip_x:
+        base[:, 0] = 120.0 - base[:, 0]
+    if flip_y:
+        base[:, 1] = 160.0 / 3.0 - base[:, 1]
+    base[:, 0] += shift_x
+    value[["base_x", "base_y"]] = base
+    answers = {int(frame_id): group[["x", "y"]].to_numpy(float)
+               for frame_id, group in truth.groupby("frame_id")}
+    groups = []
+    for index, (timestamp, group) in enumerate(value.groupby("video_timestamp")):
+        frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
+        if frame_id in answers:
+            groups.append((index, group[["base_x", "base_y"]].to_numpy(float), answers[frame_id]))
+    correction = np.eye(3)
+    fit_pairs = fit_inliers = 0
+    for maximum_distance in (15.0, 10.0, 7.0):
+        source, target = [], []
+        for index, predicted, actual in groups:
+            if index % 2:
+                continue
+            corrected = cv2.perspectiveTransform(
+                predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
+            distances = np.linalg.norm(actual[:, None, :] - corrected[None, :, :], axis=2)
+            actual_index, predicted_index = linear_sum_assignment(distances)
+            keep = distances[actual_index, predicted_index] < maximum_distance
+            source.extend(predicted[predicted_index[keep]])
+            target.extend(actual[actual_index[keep]])
+        fit_pairs = len(source)
+        if fit_pairs < 30:
+            break
+        fitted, mask = cv2.findHomography(
+            np.asarray(source, np.float32), np.asarray(target, np.float32), cv2.RANSAC, 2.0)
+        if fitted is None or mask is None:
+            break
+        correction = fitted / fitted[2, 2]
+        fit_inliers = int(mask.sum())
+    errors = []
+    matched = possible = 0
+    for index, predicted, actual in groups:
+        if index % 2 == 0:
+            continue
+        corrected = cv2.perspectiveTransform(
+            predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
+        distances = np.linalg.norm(actual[:, None, :] - corrected[None, :, :], axis=2)
+        actual_index, predicted_index = linear_sum_assignment(distances)
+        errors.extend(distances[actual_index, predicted_index].tolist())
+        matched += len(actual_index)
+        possible += len(actual)
+    if not errors:
+        raise ValueError("BDB refinement has no held-out frames")
+    return {"correction_matrix": correction.tolist(), "fit_pairs": fit_pairs,
+            "fit_inliers": fit_inliers, "held_out_player_frames": matched,
+            "held_out_coverage": matched / max(possible, 1),
+            "held_out_median_error_yards": float(np.median(errors)),
+            "held_out_p90_error_yards": float(np.percentile(errors, 90))}
+
+
 def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> dict:
     """Compare reconstructed, human-verified sources with matching BDB truth."""
     with connect(db_path) as connection:
@@ -213,6 +282,9 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                     refined.append((float(np.median(errors)), float(offset), candidate_shift,
                                     errors, matched, possible))
             median, offset, shift_x, errors, matched, possible = min(refined)
+            bdb_refinement = refine_with_bdb_tracks(
+                window, truth, float(selected["snap_s"]), bdb_snap, offset,
+                flip_x, flip_y, shift_x)
             results.append({
                 "clip_id": clip_id, "bdb_play_id": play_id, "action_id": selected["action_id"],
                 "candidate_actions": len(candidates), "selection_cost": float(selection_cost),
@@ -221,6 +293,7 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                 "matched_player_frames": matched, "possible_player_frames": possible,
                 "player_coverage": matched / max(possible, 1),
                 "median_error_yards": median, "p90_error_yards": float(np.percentile(errors, 90)),
+                "bdb_refinement": bdb_refinement,
             })
     if not results:
         raise ValueError("No audited reconstructed sources overlap BDB plays")
@@ -228,5 +301,7 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
         "game_id": game_id, "sources": len(results),
         "median_source_error_yards": float(np.median([row["median_error_yards"] for row in results])),
         "median_source_coverage": float(np.median([row["player_coverage"] for row in results])),
+        "median_refined_held_out_error_yards": float(np.median([
+            row["bdb_refinement"]["held_out_median_error_yards"] for row in results])),
         "results": results,
     }
