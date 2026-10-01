@@ -57,22 +57,25 @@ do not acquire the remaining games until its alignment audit passes.
 
 ## Prepare the 2022 BDB pilot
 
-First accept the [Big Data Bowl 2024 competition rules](https://www.kaggle.com/competitions/nfl-big-data-bowl-2024/rules)
-using the Kaggle account configured on the production box. Then run on the box:
+The NFL host removed the 2024 competition payload after the contest. Use the
+still-available, account-authorized 2026 analytics release for pass-route
+trajectory supervision; keep the 2022 pilot film for segmentation/alignment.
+Run on the box:
 
 ```bash
 cd /home/nikhil/fast/Ontology
 source scripts/production-env.sh
-python scripts/fetch-bdb-2024.py
+python scripts/fetch-bdb-2024.py \
+  --competition nfl-big-data-bowl-2026-analytics
 
-.venv/bin/all22 select-pilot-games \
-  --games data/raw/bdb-2024/games.csv \
-  --plays data/raw/bdb-2024/plays.csv
-.venv/bin/all22 import-bdb data/raw/bdb-2024/tracking_week_1.csv
+.venv/bin/all22 import-bdb \
+  data/raw/nfl-big-data-bowl-2026-analytics/train/input_2023_w01.csv
 ```
 
-The frozen pilot is BUF–LAR and PIT–CIN for development, followed by TB–DAL
-as the untouched evaluation game.
+The 2026 input files provide official 2023 tracking before the pass and their
+output counterparts provide the ball-flight continuation. This makes the
+first BDB-scored experiment pass-only; run plays remain part of the independent
+film/PBP alignment audit.
 
 ## Initialize and register a game
 
