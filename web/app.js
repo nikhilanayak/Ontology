@@ -52,7 +52,7 @@ async function loadWorkspace(){
   if(shots) await loadShots(); else await loadPlays();
 }
 async function loadShots(){
-  state.game=$('games').value;state.play=null;const shots=await json(`/api/games/${state.game}/shots`);$('plays').innerHTML='';
+  state.game=$('games').value;state.play=null;const allShots=await json(`/api/games/${state.game}/shots`);const detected=allShots.filter(shot=>shot.artifacts.some(item=>item.kind==='clip_detections'));const shots=detected.length?detected:allShots;$('plays').innerHTML='';
   for(const shot of shots){const b=document.createElement('button');b.className='play';b.innerHTML=`<small>${shot.angle} · ${Number(shot.start_s).toFixed(1)}–${Number(shot.end_s).toFixed(1)}s</small>${shot.clip_id}<small>${shot.action_count} actions · ${shot.calibration_keyframes} calibration keys</small>`;b.onclick=()=>selectShot(shot,b);$('plays').appendChild(b);}
   $('status').textContent=`${shots.length} camera shots`;if(shots.length)await selectShot(shots[0],$('plays').firstChild);
 }
