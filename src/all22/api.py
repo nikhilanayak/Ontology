@@ -25,6 +25,39 @@ class SourceTimingUpdate(BaseModel):
     play_end_s: float
 
 
+def _review_priority(play: dict) -> tuple[float, list[str]]:
+    """Rank plays where human review can resolve real uncertainty."""
+    sources = play.get("sources") or []
+    score = 0.0
+    reasons: list[str] = []
+    if len(sources) != 2:
+        score += 50
+        reasons.append(f"{len(sources)} source{'s' if len(sources) != 1 else ''}; expected 2")
+    missing_timing = sum(source.get("snap_s") is None or source.get("play_end_s") is None
+                         for source in sources)
+    if missing_timing:
+        score += 45 + 5 * missing_timing
+        reasons.append("missing action timing")
+    confidences = [float(source.get("confidence") or 0) for source in sources]
+    if confidences and min(confidences) < .5:
+        minimum = min(confidences)
+        score += 20 + 40 * (.5 - minimum)
+        reasons.append(f"low source confidence ({minimum:.2f})")
+    durations = [float(source["play_end_s"]) - float(source["snap_s"]) for source in sources
+                 if source.get("snap_s") is not None and source.get("play_end_s") is not None]
+    if len(durations) == 2 and min(durations) > 0:
+        ratio = max(durations) / min(durations)
+        if ratio >= 2:
+            score += 30 + min(30, 10 * (ratio - 2))
+            reasons.append(f"angle timings disagree ({ratio:.1f}×)")
+    # Sparse checkpoints catch monotonic alignment drift even when local
+    # confidence metrics look healthy.
+    if not reasons and int(play.get("ordinal") or 0) % 12 == 0:
+        score += 10
+        reasons.append("alignment checkpoint")
+    return score, reasons
+
+
 def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path] = None) -> FastAPI:
     app = FastAPI(title="All-22 Reconstruction", version="0.1.0")
 
@@ -43,7 +76,7 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
         with connect(db_path) as connection:
             rows = connection.execute(
                 """SELECT p.*, a.play_id, a.status AS alignment_status, q.status AS quality_status,
-                          q.reasons_json, q.metrics_json, aa.selected AS audit_selected,
+                          a.score AS alignment_score,q.reasons_json,q.metrics_json,aa.selected AS audit_selected,
                           aa.mapping_correct,aa.sources_correct,aa.timing_correct,aa.notes AS audit_notes
                    FROM pbp_plays p
                    LEFT JOIN play_alignments a ON a.game_id=p.game_id AND a.pbp_ordinal=p.ordinal
@@ -88,6 +121,24 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             }
             values.append(value)
         return values
+
+    @app.get("/api/games/{game_id}/audit-queue")
+    def audit_queue(game_id: str, limit: int = Query(30, ge=1, le=100)):
+        candidates = []
+        for play in plays(game_id):
+            audit = play.get("audit") or {}
+            if not play.get("play_id") or audit.get("mapping_correct") is not None:
+                continue
+            priority, reasons = _review_priority(play)
+            if priority <= 0:
+                continue
+            play["review_priority"] = round(priority, 2)
+            play["review_reasons"] = reasons
+            # Queue membership authorizes the audit form before a row exists.
+            play["audit"]["selected"] = True
+            candidates.append(play)
+        candidates.sort(key=lambda value: (-value["review_priority"], value["ordinal"]))
+        return candidates[:limit]
 
     @app.put("/api/plays/{play_id}/audit")
     def save_audit(play_id: str, audit: AuditUpdate):
