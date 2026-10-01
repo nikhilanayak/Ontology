@@ -1,10 +1,13 @@
 .video-stage {
   position: relative;
   margin: 12px 0;
+  max-width: 100%;
 }
 .video-stage video {
   display: block;
   margin: 0;
+  width: 100%;
+  max-height: none;
 }
 .video-stage #overlay {
   position: absolute;

@@ -2,6 +2,14 @@ const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frame
 const $ = id => document.getElementById(id);
 async function json(url, options) { const r=await fetch(url,options); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
+function sizeVideoStage() {
+  const v=$('film'), stage=v.parentElement;
+  if(!v.videoWidth||!v.videoHeight)return;
+  const available=stage.parentElement.clientWidth;
+  const maximumHeight=window.innerHeight*.42;
+  stage.style.width=`${Math.min(available,maximumHeight*v.videoWidth/v.videoHeight)}px`;
+}
+
 function field() {
   const c=$('field'), x=c.getContext('2d'); x.clearRect(0,0,c.width,c.height); x.fillStyle='#1b673c'; x.fillRect(0,0,c.width,c.height);
   x.strokeStyle='rgba(255,255,255,.8)'; x.lineWidth=2;
@@ -108,6 +116,8 @@ $('film').addEventListener('timeupdate',()=>{
   if(state.shot&&state.frames.length){let best=0;for(let i=1;i<state.frames.length;i++)if(Math.abs(state.frames[i]-$('film').currentTime)<Math.abs(state.frames[best]-$('film').currentTime))best=i;state.frame=best;$('timeline').value=best;draw();}
   if(state.activeSource&&$('film').currentTime>=sourceEnd(state.activeSource)){$('film').pause();$('film').currentTime=sourceEnd(state.activeSource);}
 });
+$('film').addEventListener('loadedmetadata',()=>{sizeVideoStage();draw();});
+window.addEventListener('resize',()=>{sizeVideoStage();draw();});
 $('audit-save').onclick=async()=>{if(!state.play?.play_id)return;$('audit-status').textContent='Saving…';try{await json(`/api/plays/${state.play.play_id}/audit`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({mapping_correct:$('audit-mapping').checked,sources_correct:$('audit-sources').checked,timing_correct:$('audit-timing').checked,notes:$('audit-notes').value})});await loadPlays();}catch(e){$('audit-status').textContent=e.message;}};
 $('timing-source').onchange=loadTimingSource;
 $('timing-save').onclick=async()=>{const index=Number($('timing-source').value)||0,source=state.play?.sources?.[index];if(!source)return;$('timing-status').textContent='Saving…';try{const result=await json(`/api/clips/${encodeURIComponent(source.clip_id)}/timing`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({snap_s:Number($('timing-snap').value),play_end_s:Number($('timing-end').value)})});source.snap_s=result.snap_s;source.play_end_s=result.play_end_s;$('timing-status').textContent='Saved';}catch(e){$('timing-status').textContent=e.message;}};
