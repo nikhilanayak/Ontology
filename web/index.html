@@ -30,6 +30,15 @@
         <textarea id="calibration-json" rows="5" placeholder='{"keyframes":[{"timestamp_s":12.0,"image_points":[...],"field_points":[...]}]}'></textarea>
         <button id="calibration-save">Save calibration</button><span id="calibration-status"></span>
       </fieldset>
+      <fieldset id="action-review" hidden>
+        <legend>Action boundary validation</legend>
+        <select id="action-select"></select>
+        <label>Formation<input id="action-formation" type="number" step="0.01"></label>
+        <label>Snap<input id="action-snap" type="number" step="0.01"></label>
+        <label>Dead<input id="action-dead" type="number" step="0.01"></label>
+        <label>Playback end<input id="action-end" type="number" step="0.01"></label>
+        <button id="action-save">Verify action</button><span id="action-status"></span>
+      </fieldset>
       <fieldset id="audit" hidden>
         <legend>Alignment audit</legend>
         <label><input id="audit-mapping" type="checkbox"> Correct play</label>

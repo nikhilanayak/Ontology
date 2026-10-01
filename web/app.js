@@ -1,4 +1,4 @@
-const state = {game:null, play:null, shot:null, tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[]};
+const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[]};
 const $ = id => document.getElementById(id);
 async function json(url, options) { const r=await fetch(url,options); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -42,6 +42,11 @@ function updateCalibrationText(){
   $('calibration-json').value=JSON.stringify({keyframes:state.calibrationKeyframes},null,2);
   $('landmark-count').textContent=`${state.calibrationCurrent?.image_points.length||0} points${state.calibrationCurrent?` at ${state.calibrationCurrent.timestamp_s.toFixed(2)}s`:''}`;
 }
+function loadActionForm(){
+  const action=state.shotActions[Number($('action-select').value)||0];if(!action)return;
+  $('action-formation').value=action.formation_start_s;$('action-snap').value=action.snap_s;$('action-dead').value=action.dead_s;$('action-end').value=action.playback_end_s;
+  $('film').currentTime=Number(action.formation_start_s);draw();
+}
 
 async function loadGames(){
   const games=await json('/api/games'); $('games').innerHTML=games.map(g=>`<option value="${g.game_id}">${g.game_id}</option>`).join('');
@@ -61,8 +66,9 @@ async function selectShot(shot,button){
   $('play-title').textContent=`${shot.angle} shot`;$('play-detail').textContent=`${shot.clip_id} · ${Number(shot.end_s-shot.start_s).toFixed(1)} seconds`;$('film').src=`/api/video/${state.game}`;
   $('audit').hidden=true;$('timing').hidden=true;$('calibration').hidden=false;$('calibration-status').textContent='';state.calibrationCurrent=null;
   const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>({timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points}));updateCalibrationText();
-  const actions=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/actions`);$('sources').innerHTML='';
+  const actions=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/actions`);state.shotActions=actions;$('sources').innerHTML='';
   for(const action of actions){const b=document.createElement('button');b.textContent=`Action ${action.action_order} · ${Number(action.snap_s).toFixed(1)}–${Number(action.dead_s).toFixed(1)}s · ${action.status}`;b.onclick=()=>seekSource({start_s:action.formation_start_s,end_s:action.playback_end_s,snap_s:action.snap_s,play_end_s:action.dead_s},b);$('sources').appendChild(b);}
+  $('action-review').hidden=!actions.length;$('action-select').innerHTML=actions.map((a,i)=>`<option value="${i}">Action ${a.action_order} · ${a.status}</option>`).join('');$('action-status').textContent='';loadActionForm();
   try{state.tracks=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/tracks?stride=2`);}catch{}
   configureTimeline([...new Set(state.tracks.map(r=>Number(r.video_timestamp)))].sort((a,b)=>a-b));
   $('diagnostics').textContent=JSON.stringify({shot,actions,track_rows:state.tracks.length},null,2);
@@ -82,7 +88,7 @@ function seekSource(source,button){
 }
 function loadTimingSource(){const sources=state.play?.sources||[],source=sources[Number($('timing-source').value)||0];if(!source)return;$('timing-snap').value=source.snap_s??source.start_s;$('timing-end').value=source.play_end_s??source.end_s;}
 async function selectPlay(p,button){
-  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('overlay').classList.remove('calibrating');
+  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('action-review').hidden=true;$('overlay').classList.remove('calibrating');
   $('play-title').textContent=`Q${p.quarter??'?'} ${p.clock??''} — ${p.possession??''}`;$('play-detail').textContent=p.description;$('diagnostics').textContent=JSON.stringify({status:p.processing_status,reasons:p.reasons,metrics:p.metrics},null,2);$('film').src=`/api/video/${state.game}`;
   const sources=p.sources||[];$('sources').innerHTML='';let firstButton=null;
   for(const [i,source] of sources.entries()){const b=document.createElement('button');if(!firstButton)firstButton=b;b.textContent=`Source ${i+1} · ${source.angle} · ${(sourceEnd(source)-sourceStart(source)).toFixed(1)}s action`;b.onclick=()=>seekSource(source,b);$('sources').appendChild(b);}
@@ -104,6 +110,8 @@ $('overlay').onclick=e=>{if(!state.calibrationCurrent)return;const rawX=$('landm
 $('landmark-undo').onclick=()=>{state.calibrationCurrent?.image_points.pop();state.calibrationCurrent?.field_points.pop();updateCalibrationText();draw();};
 $('landmark-add').onclick=()=>{if(!state.calibrationCurrent||state.calibrationCurrent.image_points.length<4){$('calibration-status').textContent='A keyframe needs at least four points.';return;}state.calibrationKeyframes.push(state.calibrationCurrent);state.calibrationKeyframes.sort((a,b)=>a.timestamp_s-b.timestamp_s);state.calibrationCurrent=null;$('overlay').classList.remove('calibrating');updateCalibrationText();draw();};
 $('calibration-save').onclick=async()=>{if(!state.shot)return;$('calibration-status').textContent='Saving…';try{const body=JSON.parse($('calibration-json').value);await json(`/api/clips/${encodeURIComponent(state.shot.clip_id)}/calibration`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});$('calibration-status').textContent='Saved; re-run projection and tracking.';}catch(e){$('calibration-status').textContent=e.message;}};
+$('action-select').onchange=loadActionForm;
+$('action-save').onclick=async()=>{const action=state.shotActions[Number($('action-select').value)||0];if(!action)return;$('action-status').textContent='Saving…';try{const body={formation_start_s:Number($('action-formation').value),snap_s:Number($('action-snap').value),dead_s:Number($('action-dead').value),playback_end_s:Number($('action-end').value)};const result=await json(`/api/actions/${encodeURIComponent(action.action_id)}/timing`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)});Object.assign(action,result);$('action-status').textContent='Verified';$('action-select').options[$('action-select').selectedIndex].text=`Action ${action.action_order} · verified`;}catch(e){$('action-status').textContent=e.message;}};
 $('games').onchange=loadWorkspace;$('workspace-mode').onchange=loadWorkspace;
 $('timeline').oninput=e=>{state.frame=Number(e.target.value);if(state.shot&&state.frames[state.frame]!=null)$('film').currentTime=state.frames[state.frame];draw();};
 $('play-animation').onclick=()=>{if(state.timer){clearInterval(state.timer);state.timer=null;return;}state.timer=setInterval(()=>{state.frame++;if(state.frame>=state.frames.length){clearInterval(state.timer);state.timer=null;return;}$('timeline').value=state.frame;draw();},100);};
