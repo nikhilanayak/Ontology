@@ -1,9 +1,10 @@
 from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
 
-from all22.actions import ActionSignature, discover_action_candidates, pair_ordered_actions
+from all22.actions import ActionSignature, discover_action_candidates, pair_ordered_actions, signature_for_action
 
 
 def _tracks(pulses: list[tuple[float, float]]) -> pd.DataFrame:
@@ -48,3 +49,12 @@ def test_pairing_uses_trajectory_similarity_and_preserves_singles():
     assert pairs[0].status == "paired"
     assert pairs[1].primary_action_id == "c"
     assert pairs[1].status == "single"
+
+
+def test_computed_signature_features_are_json_serializable():
+    tracks = _tracks([(5, 9)])
+    signature = signature_for_action(
+        {"action_id": "a", "clip_id": "c", "action_order": 1, "snap_s": 5.0, "dead_s": 9.0},
+        tracks, "sideline",
+    )
+    json.dumps({"speed_profile": signature.speed_profile, "formation": signature.formation})

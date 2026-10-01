@@ -152,12 +152,13 @@ def signature_for_action(action: dict, tracks: pd.DataFrame, angle: str) -> Acti
     points = snap_rows.groupby("track_id")[["field_x", "field_y"]].median().to_numpy()
     if len(points):
         centered = points - np.median(points, axis=0)
-        formation = tuple(np.round(np.sort(np.hypot(centered[:, 0], centered[:, 1]))[:22], 2))
+        formation = tuple(float(item) for item in np.round(
+            np.sort(np.hypot(centered[:, 0], centered[:, 1]))[:22], 2))
     else:
         formation = ()
     return ActionSignature(action["action_id"], action["clip_id"], angle, int(action["action_order"]),
                            float(action["snap_s"]), duration, team_counts, displacement,
-                           tuple(speeds.astype(float)), formation)
+                           tuple(float(item) for item in speeds), formation)
 
 
 def _profile_distance(first: Sequence[float], second: Sequence[float]) -> float:
@@ -229,9 +230,11 @@ def pair_game_actions(db_path: Path, game_id: str, tracks_dir: Path) -> list[dic
         if not action_id or action_id not in signature_by_id:
             return None
         value = signature_by_id[action_id]
-        return {"duration": value.duration, "team_counts": list(value.team_counts),
-                "displacement": value.displacement, "speed_profile": list(value.speed_profile),
-                "formation": list(value.formation), "angle": value.angle}
+        return {"duration": float(value.duration),
+                "team_counts": [int(item) for item in value.team_counts],
+                "displacement": float(value.displacement),
+                "speed_profile": [float(item) for item in value.speed_profile],
+                "formation": [float(item) for item in value.formation], "angle": value.angle}
 
     with transaction(db_path) as connection:
         old = connection.execute(
