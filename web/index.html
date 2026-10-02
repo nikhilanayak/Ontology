@@ -19,6 +19,16 @@
     <section class="workspace">
       <div class="summary"><h2 id="play-title">Select a play</h2><p id="play-detail"></p></div>
       <div class="video-stage"><video id="film" controls preload="metadata"></video><canvas id="overlay"></canvas></div>
+      <div id="layers" class="layers">
+        <strong>Overlay</strong>
+        <label><input type="checkbox" id="layer-tracks" checked> Tracked players</label>
+        <label><input type="checkbox" id="layer-detections"> Raw detections</label>
+        <label><input type="checkbox" id="layer-lines"> Detected yard lines</label>
+        <label><input type="checkbox" id="layer-numbers"> Detected numbers</label>
+        <label><input type="checkbox" id="layer-grid"> Calibrated field grid</label>
+        <label><input type="checkbox" id="layer-labels" checked> Labels</label>
+        <span id="layer-status"></span>
+      </div>
       <div id="sources" class="sources"></div>
       <fieldset id="calibration" hidden>
         <legend>Shot calibration</legend>

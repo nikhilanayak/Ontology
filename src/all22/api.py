@@ -203,13 +203,18 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
     def calibration(clip_id: str):
         with connect(db_path) as connection:
             rows = connection.execute(
-                """SELECT timestamp_s,landmarks_json,inlier_ratio,median_error_yards,p95_error_yards,
-                          revision,status FROM shot_calibration_keyframes WHERE clip_id=? ORDER BY timestamp_s""",
+                """SELECT timestamp_s,landmarks_json,matrix_json,inlier_ratio,median_error_yards,
+                          p95_error_yards,revision,status FROM shot_calibration_keyframes
+                   WHERE clip_id=? ORDER BY timestamp_s""",
                 (clip_id,),
             ).fetchall()
         values = []
         for row in rows:
             item = dict(row)
+            # The image-to-field matrix lets the viewer reproject the field
+            # template back onto the film, which is how a five-yard placement
+            # error becomes visible rather than merely numerical.
+            item["matrix"] = json.loads(item.pop("matrix_json") or "null")
             item.update(json.loads(item.pop("landmarks_json")))
             values.append(item)
         return {"clip_id": clip_id, "keyframes": values}
@@ -380,6 +385,26 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             raise HTTPException(422, str(error)) from error
         return {"clip_id": clip_id, "angle": clip["angle"], "start_s": start, "end_s": end,
                 "timestamp_s": when, **payload}
+
+    @app.get("/api/clips/{clip_id}/detections")
+    def clip_detections(clip_id: str, stride: int = Query(1, ge=1, le=20)):
+        """Raw detector output, before projection and tracking filtered it."""
+        with connect(db_path) as connection:
+            row = connection.execute(
+                """SELECT path FROM artifacts WHERE clip_id=? AND kind='clip_detections'
+                   ORDER BY artifact_id DESC LIMIT 1""", (clip_id,),
+            ).fetchone()
+        if not row or not Path(row["path"]).exists():
+            raise HTTPException(404, "Clip detection artifact not found")
+        frame = pd.read_parquet(row["path"])
+        keep = [column for column in
+                ("video_timestamp", "x1", "y1", "x2", "y2", "confidence", "detection_id")
+                if column in frame.columns]
+        frame = frame[keep]
+        if stride > 1:
+            timestamps = sorted(frame.video_timestamp.unique())[::stride]
+            frame = frame[frame.video_timestamp.isin(timestamps)]
+        return frame.where(pd.notnull(frame), None).to_dict(orient="records")
 
     @app.get("/api/clips/{clip_id}/frame.jpg")
     def clip_frame(clip_id: str, timestamp_s: Optional[float] = None):

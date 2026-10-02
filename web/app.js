@@ -1,4 +1,5 @@
-const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[], fieldDebug:null};
+const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[], fieldDebug:null, detections:[], calibrationMatrices:[], frameDetections:new Map()};
+const layerOn = id => $(id)?.checked;
 const $ = id => document.getElementById(id);
 async function json(url, options) { const r=await fetch(url,options); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -21,14 +22,130 @@ function currentRows() {
   const key=state.frames[state.frame];
   return state.tracks.filter(r => state.shot ? Number(r.video_timestamp)===Number(key) : Number(r.frame_id)===Number(key));
 }
+// Interpolate the stored image-to-field homographies to a timestamp, matching
+// how projection does it, so the drawn grid is the geometry actually in use.
+function matrixAt(timestamp){
+  const keys=state.calibrationMatrices;
+  if(!keys.length)return null;
+  if(timestamp<=keys[0].timestamp_s)return keys[0].matrix;
+  if(timestamp>=keys.at(-1).timestamp_s)return keys.at(-1).matrix;
+  let i=0;while(i<keys.length-1&&keys[i+1].timestamp_s<timestamp)i++;
+  const a=keys[i],b=keys[i+1],span=b.timestamp_s-a.timestamp_s;
+  if(span<=0)return a.matrix;
+  const f=(timestamp-a.timestamp_s)/span;
+  const m=a.matrix.map((row,r)=>row.map((v,c)=>(1-f)*v+f*b.matrix[r][c]));
+  const s=m[2][2]||1;return m.map(row=>row.map(v=>v/s));
+}
+function invert3(m){
+  const [[a,b,c],[d,e,f],[g,h,i]]=m;
+  const A=e*i-f*h,B=-(d*i-f*g),C=d*h-e*g;
+  const det=a*A+b*B+c*C;
+  if(!det||!isFinite(det))return null;
+  return [[A/det,(c*h-b*i)/det,(b*f-c*e)/det],
+          [B/det,(a*i-c*g)/det,(c*d-a*f)/det],
+          [C/det,(b*g-a*h)/det,(a*e-b*d)/det]];
+}
+function applyH(m,x,y){
+  const w=m[2][0]*x+m[2][1]*y+m[2][2];
+  if(!w)return null;
+  return [(m[0][0]*x+m[0][1]*y+m[0][2])/w,(m[1][0]*x+m[1][1]*y+m[1][2])/w];
+}
+// Draw the official field template back onto the film. If the registration sat
+// on the wrong yard lines, the painted lines and the drawn grid separate by a
+// visible five yards, which a residual number cannot show.
+function drawFieldGrid(x,timestamp,width,height){
+  const forward=matrixAt(timestamp);if(!forward)return false;
+  const inverse=invert3(forward);if(!inverse)return false;
+  const visible=([px,py])=>px>-width&&px<2*width&&py>-height&&py<2*height;
+  x.lineWidth=2;
+  for(let yd=0;yd<=120;yd+=5){
+    const a=applyH(inverse,yd,0),b=applyH(inverse,yd,160/3);
+    if(!a||!b||!(visible(a)||visible(b)))continue;
+    const major=yd%10===0;
+    x.strokeStyle=major?'rgba(255,90,160,.95)':'rgba(255,90,160,.45)';
+    x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();
+    if(major&&layerOn('layer-labels')){
+      const label=yd<=60?Math.max(0,yd-10):110-yd;
+      x.fillStyle='rgba(255,90,160,.95)';x.font='bold 15px system-ui';
+      x.fillText(String(label),a[0]+4,Math.max(15,a[1]-4));
+    }
+  }
+  for(const yline of [0,160/3]){
+    const a=applyH(inverse,0,yline),b=applyH(inverse,120,yline);
+    if(a&&b){x.strokeStyle='rgba(255,90,160,.8)';x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();}
+  }
+  return true;
+}
 function drawOverlay(rows) {
-  const c=$('overlay'), v=$('film'), x=c.getContext('2d'); c.width=v.videoWidth||1280; c.height=v.videoHeight||720; x.clearRect(0,0,c.width,c.height);
-  for(const r of rows){
-    const x1=r.bbox_x1??r.x1, y1=r.bbox_y1??r.y1, x2=r.bbox_x2??r.x2, y2=r.bbox_y2??r.y2;
-    if(x1==null) continue;
-    x.strokeStyle=r.team==='team_0'?'#67d5ff':'#ffd166'; x.lineWidth=3;
-    x.strokeRect(Number(x1),Number(y1),Number(x2-x1),Number(y2-y1));
-    x.fillStyle=x.strokeStyle;x.font='16px system-ui';x.fillText(String(r.track_id||''),Number(x1),Math.max(16,Number(y1)-4));
+  const c=$('overlay'), v=$('film'), x=c.getContext('2d');
+  c.width=v.videoWidth||1280; c.height=v.videoHeight||720; x.clearRect(0,0,c.width,c.height);
+  const time=v.currentTime;
+  const labels=layerOn('layer-labels');
+  const notes=[];
+  if(layerOn('layer-detections')){
+    // Nearest sampled detection frame; detections are stored at 10 Hz.
+    let best=null,bestGap=Infinity;
+    for(const key of state.frameDetections.keys()){
+      const gap=Math.abs(key-time);
+      if(gap<bestGap){bestGap=gap;best=key;}
+    }
+    if(best!=null&&bestGap<=.2){
+      const items=state.frameDetections.get(best);
+      x.lineWidth=2;
+      for(const d of items){
+        const alpha=Math.max(.25,Math.min(1,Number(d.confidence??1)));
+        x.strokeStyle=`rgba(160,160,170,${alpha})`;
+        x.strokeRect(Number(d.x1),Number(d.y1),Number(d.x2-d.x1),Number(d.y2-d.y1));
+        if(labels){x.fillStyle=`rgba(200,200,210,${alpha})`;x.font='12px system-ui';
+          x.fillText(Number(d.confidence??0).toFixed(2),Number(d.x1),Number(d.y2)+12);}
+      }
+      notes.push(`${items.length} detections @ ${best.toFixed(2)}s`);
+    }
+  }
+  if(layerOn('layer-tracks')){
+    for(const r of rows){
+      const x1=r.bbox_x1??r.x1, y1=r.bbox_y1??r.y1, x2=r.bbox_x2??r.x2, y2=r.bbox_y2??r.y2;
+      if(x1==null) continue;
+      x.strokeStyle=r.team==='team_0'?'#67d5ff':r.team==='team_1'?'#ffd166':r.team==='official'?'#d6a4ff':'#9aa0a6';
+      x.lineWidth=3;
+      x.strokeRect(Number(x1),Number(y1),Number(x2-x1),Number(y2-y1));
+      if(labels){x.fillStyle=x.strokeStyle;x.font='16px system-ui';
+        x.fillText(String(r.track_id||'').split(':').at(-1),Number(x1),Math.max(16,Number(y1)-4));}
+    }
+    if(rows.length)notes.push(`${rows.length} tracks`);
+  }
+  if(layerOn('layer-grid')&&drawFieldGrid(x,time,c.width,c.height))notes.push('calibrated grid');
+  const debug=state.fieldDebug;
+  if(debug&&Math.abs(debug.timestamp_s-time)<=.35){
+    if(layerOn('layer-lines')){
+      x.lineWidth=3;
+      for(const line of debug.lines){
+        const [a,b]=line.image_points;
+        x.strokeStyle=line.assigned_field_x==null?'rgba(255,120,120,.95)':'rgba(90,200,255,.95)';
+        x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();
+        if(labels&&line.assigned_field_x!=null){
+          x.fillStyle='#bfe9ff';x.font='bold 15px system-ui';
+          x.fillText(`x=${line.assigned_field_x.toFixed(0)}`,a[0]+4,a[1]+18);
+        }
+      }
+      notes.push(`${debug.lines.length} detected lines`);
+    }
+    if(layerOn('layer-numbers')){
+      for(const n of debug.numbers){
+        const [cx,cy]=n.center;
+        x.strokeStyle=n.trusted?'rgba(130,255,150,.95)':'rgba(255,190,80,.95)';
+        x.lineWidth=3;x.beginPath();x.arc(cx,cy,14,0,Math.PI*2);x.stroke();
+        if(labels){
+          x.fillStyle=n.trusted?'#b7ffc4':'#ffd79a';x.font='bold 15px system-ui';
+          x.fillText(`${n.value} ${n.confidence.toFixed(2)}`,cx+18,cy+5);
+          x.font='12px system-ui';
+          x.fillText(`${n.candidate_field_x.join(' or ')}`,cx+18,cy+21);
+        }
+      }
+      notes.push(`${debug.numbers.length} numbers`);
+    }
+  } else if(debug&&(layerOn('layer-lines')||layerOn('layer-numbers'))){
+    notes.push(`detections are for ${debug.timestamp_s.toFixed(2)}s — re-inspect at this time`);
   }
   const annotations=state.calibrationCurrent?.annotations||[];
   for(const [index,annotation] of annotations.entries()){
@@ -39,6 +156,7 @@ function drawOverlay(rows) {
   }
   const pending=state.calibrationCurrent?.pendingLine;
   if(pending){x.beginPath();x.fillStyle='#ff4f87';x.arc(pending[0],pending[1],7,0,Math.PI*2);x.fill();}
+  const status=$('layer-status');if(status)status.textContent=notes.join(' · ');
 }
 function draw() {
   field(); const rows=currentRows(), c=$('field'), x=c.getContext('2d');
@@ -81,6 +199,16 @@ async function selectShot(shot,button){
   $('audit').hidden=true;$('timing').hidden=true;$('calibration').hidden=false;$('calibration-status').textContent='';state.calibrationCurrent=null;
   $('field-debug').hidden=false;$('debug-status').textContent='';$('debug-time').value=Number(shot.start_s).toFixed(2);state.fieldDebug=null;drawFieldDebug();
   const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>k.annotations?.length?{timestamp_s:k.timestamp_s,annotations:k.annotations}:{timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points});updateCalibrationText();
+  state.calibrationMatrices=savedCalibration.keyframes.filter(k=>Array.isArray(k.matrix)).map(k=>({timestamp_s:Number(k.timestamp_s),matrix:k.matrix}));
+  state.detections=[];state.frameDetections=new Map();
+  try{
+    state.detections=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/detections`);
+    for(const d of state.detections){
+      const key=Number(Number(d.video_timestamp).toFixed(3));
+      if(!state.frameDetections.has(key))state.frameDetections.set(key,[]);
+      state.frameDetections.get(key).push(d);
+    }
+  }catch{}
   const actions=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/actions`);state.shotActions=actions;$('sources').innerHTML='';
   for(const action of actions){const b=document.createElement('button');b.textContent=`Action ${action.action_order} · ${Number(action.snap_s).toFixed(1)}–${Number(action.dead_s).toFixed(1)}s · ${action.status}`;b.onclick=()=>seekSource({start_s:action.formation_start_s,end_s:action.playback_end_s,snap_s:action.snap_s,play_end_s:action.dead_s},b);$('sources').appendChild(b);}
   $('action-review').hidden=!actions.length;$('action-select').innerHTML=actions.map((a,i)=>`<option value="${i}">Action ${a.action_order} · ${a.status}</option>`).join('');$('action-status').textContent='';loadActionForm();
@@ -209,3 +337,29 @@ async function inspectFrame(){
 $('debug-run').onclick=inspectFrame;
 $('debug-here').onclick=()=>{$('debug-time').value=$('film').currentTime.toFixed(2);inspectFrame();};
 window.addEventListener('resize',drawFieldDebug);
+
+
+// Keep the overlay aligned with the film while it plays. requestAnimationFrame
+// follows the real playback clock rather than the sampled track timeline.
+let overlayFrame=null;
+function followVideo(){
+  const film=$('film');
+  if(!film.paused&&!film.ended){
+    if(state.shot&&state.frames.length){
+      // Snap the field diagram to the nearest sampled track frame.
+      let best=0,gap=Infinity;
+      for(const [i,key] of state.frames.entries()){
+        const d=Math.abs(Number(key)-film.currentTime);
+        if(d<gap){gap=d;best=i;}
+      }
+      if(best!==state.frame){state.frame=best;$('timeline').value=best;}
+    }
+    draw();
+  }
+  overlayFrame=requestAnimationFrame(followVideo);
+}
+overlayFrame=requestAnimationFrame(followVideo);
+for(const id of ['layer-tracks','layer-detections','layer-lines','layer-numbers','layer-grid','layer-labels'])
+  $(id)?.addEventListener('change',()=>draw());
+$('film').addEventListener('seeked',()=>draw());
+$('film').addEventListener('loadeddata',()=>draw());

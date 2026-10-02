@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from all22.api import create_app
@@ -125,3 +126,43 @@ def test_field_detection_debug_endpoint_reports_lines_numbers_and_ambiguity(tmp_
     # Timestamps outside the shot are refused rather than silently clamped.
     assert client.get("/api/clips/c1/field-detections", params={"timestamp_s": 99}).status_code == 422
     assert client.get("/api/clips/missing/field-detections").status_code == 404
+
+
+def test_calibration_exposes_matrix_and_detections_endpoint(tmp_path: Path):
+    """The viewer needs the homography to reproject the field onto the film."""
+    import pandas as pd
+
+    database = tmp_path / "overlay.sqlite3"
+    initialize(database)
+    with transaction(database) as connection:
+        connection.execute("INSERT INTO games(game_id,video_path) VALUES('g',NULL)")
+        connection.execute(
+            """INSERT INTO clips(clip_id,game_id,angle,start_s,end_s,confidence)
+               VALUES('c1','g','sideline',0,20,.9)""")
+    detections = tmp_path / "detections.parquet"
+    pd.DataFrame([
+        {"clip_id": "c1", "video_timestamp": 1.0, "x1": 10.0, "y1": 20.0, "x2": 30.0,
+         "y2": 70.0, "confidence": .91, "detection_id": 0},
+        {"clip_id": "c1", "video_timestamp": 1.1, "x1": 12.0, "y1": 21.0, "x2": 32.0,
+         "y2": 71.0, "confidence": .44, "detection_id": 0},
+    ]).to_parquet(detections, index=False)
+    with transaction(database) as connection:
+        connection.execute(
+            """INSERT INTO artifacts(game_id,clip_id,kind,path) VALUES('g','c1','clip_detections',?)""",
+            (str(detections),))
+    client = TestClient(create_app(database, tmp_path / "trajectories", None))
+    client.put("/api/clips/c1/calibration", json={"keyframes": [{
+        "timestamp_s": 5,
+        "image_points": [[0, 0], [100, 0], [0, 100], [100, 100]],
+        "field_points": [[10, 0], [20, 0], [10, 20], [20, 20]],
+    }]})
+    keyframe = client.get("/api/clips/c1/calibration").json()["keyframes"][0]
+    matrix = keyframe["matrix"]
+    assert len(matrix) == 3 and len(matrix[0]) == 3
+    assert matrix[2][2] == pytest.approx(1.0)
+    rows = client.get("/api/clips/c1/detections").json()
+    assert len(rows) == 2
+    assert rows[0]["confidence"] == pytest.approx(.91)
+    assert {"x1", "y1", "x2", "y2", "video_timestamp"} <= set(rows[0])
+    assert client.get("/api/clips/c1/detections", params={"stride": 2}).json() == [rows[0]]
+    assert client.get("/api/clips/missing/detections").status_code == 404

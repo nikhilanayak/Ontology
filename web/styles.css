@@ -9,3 +9,8 @@
 .debug-table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-top: .4rem; }
 .debug-table th, .debug-table td { text-align: left; padding: .2rem .4rem; border-bottom: 1px solid rgba(255,255,255,.12); }
 .debug-table tr.untrusted td { color: #ffbe50; }
+
+.layers { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; margin: .4rem 0 .2rem; font-size: .82rem; }
+.layers strong { font-weight: 600; opacity: .8; }
+.layers label { display: inline-flex; align-items: center; gap: .3rem; margin: 0; }
+.layers #layer-status { opacity: .7; font-style: italic; }
