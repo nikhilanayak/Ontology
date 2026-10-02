@@ -8,8 +8,8 @@ Do not run the full season yet. The immediate objective is to improve and valida
 
 ## Current state
 
-- Current actual local HEAD: `ae4a84798189c3390a3923d593fc58f49a9cb35a` (`ae4a847 Separate spatial observations from durable identities`).
-- Commit `ae4a847` was deployed. The latest known local commit sequence is through `ae4a847`; future agents must re-check `git rev-parse HEAD` because Git may have advanced after this handoff.
+- Code/evaluation baseline `ae4a847` (`Separate spatial observations from durable identities`) is deployed on production.
+- Handoff documents were added and pushed in `dc0d9a1` (`Document agent workflow and project handoff`). Future agents must run `git rev-parse HEAD` and compare local, GitHub, and production before changing or deploying code.
 - Full test suite: **51 tests passing**.
 - Implemented: semantic field calibration, keyframed field tracking, crowd gating, role-aware tracking, camera-angle scale gating, tracklet relinking, identity evaluation, 64-dimensional ResNet18 appearance embeddings, and separation of spatial observations from durable identity evaluation.
 - The conservative tracklet relinker accepted **zero** joins on clips `0005`, `0278`, and `0295`; do not loosen its gates without an identity-metric improvement. This is currently a fail-closed capability, not a demonstrated quality gain.
