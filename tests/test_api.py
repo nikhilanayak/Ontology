@@ -112,6 +112,10 @@ def test_field_detection_debug_endpoint_reports_lines_numbers_and_ambiguity(tmp_
     payload = response.json()
     assert payload["frame_width"] == width and payload["frame_height"] == height
     assert payload["lines"], "the detector should find the painted yard lines"
+    assert payload["line_evidence"], "the debug view must include rejected field-line candidates"
+    assert {"image_points", "length_pixels", "angle_degrees", "kind"} <= set(payload["line_evidence"][0])
+    assert {item["kind"] for item in payload["line_evidence"]} <= {
+        "cross_field", "downfield_boundary", "other", "unclassified"}
     for line in payload["lines"]:
         assert len(line["image_points"]) == 2
     # No painted numbers exist here, so absolute position must stay unresolved

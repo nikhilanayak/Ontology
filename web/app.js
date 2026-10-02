@@ -118,6 +118,20 @@ function drawOverlay(rows) {
   if(layerOn('layer-grid')&&drawFieldGrid(x,time,c.width,c.height))notes.push('calibrated grid');
   const debug=state.fieldDebug;
   if(debug&&Math.abs(debug.timestamp_s-time)<=.35){
+    if(layerOn('layer-all-lines')){
+      x.lineWidth=1.5;
+      for(const line of debug.line_evidence||[]){
+        const [a,b]=line.image_points;
+        // Teal: cross-field candidates; yellow: sidelines/boundaries; grey: everything else.
+        x.strokeStyle=line.kind==='cross_field'?'rgba(80,255,220,.62)':line.kind==='downfield_boundary'?'rgba(255,225,70,.7)':'rgba(220,220,220,.35)';
+        x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();
+        if(labels&&line.length_pixels>100){
+          x.fillStyle=x.strokeStyle;x.font='11px system-ui';
+          x.fillText(`${line.kind} ${line.length_pixels.toFixed(0)}px`,(a[0]+b[0])/2,(a[1]+b[1])/2);
+        }
+      }
+      notes.push(`${(debug.line_evidence||[]).length} all line candidates`);
+    }
     if(layerOn('layer-lines')){
       x.lineWidth=3;
       for(const line of debug.lines){
@@ -360,7 +374,7 @@ function followVideo(){
   overlayFrame=requestAnimationFrame(followVideo);
 }
 overlayFrame=requestAnimationFrame(followVideo);
-for(const id of ['layer-tracks','layer-detections','layer-lines','layer-numbers','layer-grid','layer-labels'])
+for(const id of ['layer-tracks','layer-detections','layer-lines','layer-all-lines','layer-numbers','layer-grid','layer-labels'])
   $(id)?.addEventListener('change',()=>draw());
 $('film').addEventListener('seeked',()=>draw());
 $('film').addEventListener('loadeddata',()=>draw());

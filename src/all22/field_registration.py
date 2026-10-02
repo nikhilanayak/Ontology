@@ -659,6 +659,48 @@ def auto_reconstruct_game(db_path: Path, game_id: str, output_root: Path,
     return results
 
 
+def detect_field_line_evidence(frame: np.ndarray, mask: np.ndarray, white: np.ndarray,
+                               yard_lines: list[np.ndarray]) -> list[dict]:
+    """Return every visible long white segment, not just the accepted yard family.
+
+    The calibrator deliberately keeps only a clean, parallel family. That is
+    right for fitting a homography but wrong for debugging: the reviewer needs
+    to see what was rejected as a hash mark, sideline, numeral stroke, or an
+    orientation conflict. Segments are classified relative to the accepted
+    yard-line direction when it exists.
+    """
+    edges = cv2.Canny(white, 50, 150)
+    raw = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=22,
+                           minLineLength=max(25, int(min(frame.shape[:2]) * .08)),
+                           maxLineGap=20)
+    if raw is None:
+        return []
+    yard_angle = None
+    if yard_lines:
+        vector = yard_lines[0][1] - yard_lines[0][0]
+        yard_angle = float(np.mod(np.arctan2(vector[1], vector[0]), np.pi))
+    evidence = []
+    for index, segment in enumerate(raw[:, 0, :]):
+        points = segment.reshape(2, 2).astype(float)
+        vector = points[1] - points[0]
+        length = float(np.linalg.norm(vector))
+        angle = float(np.mod(np.arctan2(vector[1], vector[0]), np.pi))
+        kind = "unclassified"
+        if yard_angle is not None:
+            parallel = _angle_distance(angle, yard_angle)
+            perpendicular = abs(parallel - np.pi / 2)
+            if parallel < np.deg2rad(8):
+                kind = "cross_field"
+            elif perpendicular < np.deg2rad(12):
+                kind = "downfield_boundary"
+            else:
+                kind = "other"
+        evidence.append({"index": int(index), "image_points": points.tolist(),
+                         "length_pixels": length, "angle_degrees": float(np.degrees(angle)),
+                         "kind": kind})
+    return evidence
+
+
 def describe_field_detections(video_path: Path, timestamp_s: float, reader=None) -> dict:
     """Report what field registration actually detected in one frame.
 
@@ -681,6 +723,7 @@ def describe_field_detections(video_path: Path, timestamp_s: float, reader=None)
         raise ValueError(f"Could not decode a frame at {timestamp_s:.2f}s")
     height, width = frame.shape[:2]
     lines, mask, white = detect_yard_lines(frame)
+    line_evidence = detect_field_line_evidence(frame, mask, white, lines)
     # Line geometry is still worth showing when OCR is unavailable, and the
     # absence of numbers is itself the finding: without them the five-yard
     # ambiguity cannot be resolved.
@@ -723,6 +766,7 @@ def describe_field_detections(video_path: Path, timestamp_s: float, reader=None)
         number_rows = [None] * len(raw_numbers)
     return {
         "frame_width": int(width), "frame_height": int(height),
+        "line_evidence": line_evidence,
         "lines": [{"index": index,
                    "image_points": [[float(point[0]), float(point[1])] for point in line],
                    "assigned_field_x": assigned[index]}
