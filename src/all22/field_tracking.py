@@ -369,6 +369,70 @@ class FieldSpaceTracker:
         return assigned
 
 
+def relink_tracklets(frame: pd.DataFrame, maximum_gap_s: float = .8) -> tuple[pd.DataFrame, int]:
+    """Join short, non-overlapping fragments only when several cues agree."""
+    if frame.empty or frame.track_id.nunique() < 2:
+        return frame.copy(), 0
+    summaries = {}
+    appearance_columns = [column for column in FieldSpaceTracker.appearance_columns if column in frame]
+    for track_id, rows in frame.groupby("track_id"):
+        rows = rows.sort_values("video_timestamp")
+        first, last = rows.iloc[0], rows.iloc[-1]
+        team_values = rows.loc[rows.team != "unknown", "team"] if "team" in rows else pd.Series(dtype=str)
+        summaries[track_id] = {
+            "start": float(first.video_timestamp), "end": float(last.video_timestamp),
+            "start_position": first[["field_x", "field_y"]].to_numpy(float),
+            "end_position": last[["field_x", "field_y"]].to_numpy(float),
+            "velocity": np.asarray([float(last.get("vx", 0) or 0),
+                                    float(last.get("vy", 0) or 0)]),
+            "appearance": rows[appearance_columns].median().to_numpy(float),
+            "team": str(team_values.mode().iloc[0]) if len(team_values) else "unknown",
+            "shape": np.asarray([float(last.x2 - last.x1), float(last.y2 - last.y1)])
+                     if {"x1", "y1", "x2", "y2"}.issubset(rows.columns) else None,
+            "start_shape": np.asarray([float(first.x2 - first.x1), float(first.y2 - first.y1)])
+                           if {"x1", "y1", "x2", "y2"}.issubset(rows.columns) else None,
+        }
+    scale_lookup = dict(zip(FieldSpaceTracker.appearance_columns, FieldSpaceTracker.appearance_scale))
+    appearance_scale = np.asarray([scale_lookup[column] for column in appearance_columns])
+    candidates = []
+    for predecessor, left in summaries.items():
+        for successor, right in summaries.items():
+            gap = right["start"] - left["end"]
+            if predecessor == successor or not 0 < gap <= maximum_gap_s:
+                continue
+            if (left["team"] != "unknown" and right["team"] != "unknown"
+                    and left["team"] != right["team"]):
+                continue
+            predicted = left["end_position"] + left["velocity"] * gap
+            distance = float(np.linalg.norm(predicted - right["start_position"]))
+            if distance > 12 * gap + 1.5:
+                continue
+            appearance = float(np.linalg.norm(
+                (left["appearance"] - right["appearance"]) / appearance_scale)) if len(appearance_scale) else 0
+            if not np.isfinite(appearance) or appearance > 2.25:
+                continue
+            shape = 0.0
+            if left["shape"] is not None and np.all(left["shape"] > 0) and np.all(right["start_shape"] > 0):
+                shape = float(np.linalg.norm(np.log(right["start_shape"] / left["shape"])))
+                if shape > 1.0:
+                    continue
+            candidates.append((distance + .8 * appearance + .5 * shape, predecessor, successor))
+    used_left, used_right, links = set(), set(), {}
+    for _, predecessor, successor in sorted(candidates):
+        if predecessor in used_left or successor in used_right:
+            continue
+        links[successor] = predecessor
+        used_left.add(predecessor); used_right.add(successor)
+    def root(track_id):
+        seen = set()
+        while track_id in links and track_id not in seen:
+            seen.add(track_id); track_id = links[track_id]
+        return track_id
+    result = frame.copy()
+    result["track_id"] = result.track_id.map(root)
+    return result, len(links)
+
+
 def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: Path) -> dict:
     with connect(db_path) as connection:
         action = connection.execute(
@@ -403,7 +467,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         value["observed"] = True
         value["interpolated"] = False
         parts.append(value)
-    result = pd.concat(parts, ignore_index=True)
+    result, tracklet_links = relink_tracklets(pd.concat(parts, ignore_index=True))
     total_frames = max(1, int(result.video_timestamp.nunique()))
     observations = result.groupby("track_id").size()
     coverage = (observations / total_frames).clip(upper=1)
@@ -446,9 +510,11 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
              json.dumps({"rows": len(result), "tracks": int(result.track_id.nunique()),
                          "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
                          "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
+                         "tracklet_links": tracklet_links,
                          "team_labeled_fraction": float((result.team != 'unknown').mean())})),
         )
     return {"rows": len(result), "tracks": int(result.track_id.nunique()),
             "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
             "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
+            "tracklet_links": tracklet_links,
             "team_labeled_fraction": float((result.team != "unknown").mean())}

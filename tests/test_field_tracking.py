@@ -9,6 +9,7 @@ from all22.field_tracking import (
     project_clip,
     save_calibration_keyframes,
     track_projected_clip,
+    relink_tracklets,
 )
 
 
@@ -121,3 +122,20 @@ def test_snap_color_clusters_separate_small_official_group():
     classified = assign_team_probabilities(pd.DataFrame(rows), anchor_timestamp=1.0)
     assert classified.person_role.value_counts().to_dict() == {"player": 10, "official": 2}
     assert set(classified.team) == {"team_0", "team_1", "official"}
+
+
+def test_relink_tracklets_joins_compatible_non_overlapping_fragments():
+    rows = []
+    for track_id, times, xs, color in [
+        ("a", [0.0, .1], [10.0, 10.5], 90),
+        ("b", [.3, .4], [11.5, 12.0], 91),
+        ("other", [.3, .4], [30.0, 30.5], 180),
+    ]:
+        for timestamp, x in zip(times, xs):
+            rows.append({"track_id": track_id, "video_timestamp": timestamp,
+                         "field_x": x, "field_y": 20.0, "vx": 5.0, "vy": 0.0,
+                         "team": "team_0", "lab_a": color, "lab_b": color})
+    linked, count = relink_tracklets(pd.DataFrame(rows))
+    assert count == 1
+    assert linked[linked.video_timestamp < .2].track_id.iloc[0] == linked[linked.field_x == 12].track_id.iloc[0]
+    assert linked.track_id.nunique() == 2
