@@ -88,7 +88,7 @@ class TorchvisionPersonDetector:
         self.appearance_model = resnet18(weights=appearance_weights).to(self.device).eval()
         self.appearance_model.fc = torch.nn.Identity()
         generator = np.random.default_rng(20261002)
-        projection = generator.normal(size=(512, 64)).astype(np.float32) / np.sqrt(64)
+        projection = (generator.normal(size=(512, 64)) / np.sqrt(64)).astype(np.float32)
         self.appearance_projection = torch.from_numpy(projection).to(self.device)
         self.threshold = threshold
 
