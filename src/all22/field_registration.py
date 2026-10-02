@@ -660,45 +660,46 @@ def auto_reconstruct_game(db_path: Path, game_id: str, output_root: Path,
 
 
 def detect_field_line_evidence(frame: np.ndarray, mask: np.ndarray, white: np.ndarray,
-                               yard_lines: list[np.ndarray]) -> list[dict]:
-    """Return every visible long white segment, not just the accepted yard family.
+                               yard_lines: list[np.ndarray]) -> dict:
+    """Fit visible white field paint into a small set of stable line hypotheses.
 
-    The calibrator deliberately keeps only a clean, parallel family. That is
-    right for fitting a homography but wrong for debugging: the reviewer needs
-    to see what was rejected as a hash mark, sideline, numeral stroke, or an
-    orientation conflict. Segments are classified relative to the accepted
-    yard-line direction when it exists.
+    Hough returns two edges for each painted stripe plus fragments split by
+    players, which is useful internally but unreadable as an overlay. Cluster
+    parallel fragments by their normal coordinate and extend each fitted model
+    through the green-field mask, yielding one visually meaningful segment per
+    candidate painted line. Raw fragments are counted for diagnostics, never
+    drawn by default.
     """
     edges = cv2.Canny(white, 50, 150)
     raw = cv2.HoughLinesP(edges, 1, np.pi / 360, threshold=22,
                            minLineLength=max(25, int(min(frame.shape[:2]) * .08)),
                            maxLineGap=20)
-    if raw is None:
-        return []
-    yard_angle = None
-    if yard_lines:
-        vector = yard_lines[0][1] - yard_lines[0][0]
-        yard_angle = float(np.mod(np.arctan2(vector[1], vector[0]), np.pi))
-    evidence = []
-    for index, segment in enumerate(raw[:, 0, :]):
-        points = segment.reshape(2, 2).astype(float)
-        vector = points[1] - points[0]
-        length = float(np.linalg.norm(vector))
-        angle = float(np.mod(np.arctan2(vector[1], vector[0]), np.pi))
-        kind = "unclassified"
-        if yard_angle is not None:
-            parallel = _angle_distance(angle, yard_angle)
-            perpendicular = abs(parallel - np.pi / 2)
-            if parallel < np.deg2rad(8):
-                kind = "cross_field"
-            elif perpendicular < np.deg2rad(12):
-                kind = "downfield_boundary"
-            else:
-                kind = "other"
-        evidence.append({"index": int(index), "image_points": points.tolist(),
-                         "length_pixels": length, "angle_degrees": float(np.degrees(angle)),
-                         "kind": kind})
-    return evidence
+    if raw is None or not yard_lines:
+        return {"raw_count": 0 if raw is None else int(len(raw)), "fitted": []}
+    segments = raw[:, 0, :]
+    vectors = segments[:, 2:4] - segments[:, 0:2]
+    angles = np.mod(np.arctan2(vectors[:, 1], vectors[:, 0]), np.pi)
+    yard_vector = yard_lines[0][1] - yard_lines[0][0]
+    yard_angle = float(np.mod(np.arctan2(yard_vector[1], yard_vector[0]), np.pi))
+    fitted = []
+    for kind, target, tolerance in (
+        ("cross_field", yard_angle, np.deg2rad(8)),
+        ("downfield_boundary", (yard_angle + np.pi / 2) % np.pi, np.deg2rad(12)),
+    ):
+        keep = np.asarray([_angle_distance(angle, target) < tolerance for angle in angles])
+        if not keep.any():
+            continue
+        # _merge_family is the same robust grouping the calibrator uses: it
+        # collapses both edges and player-split fragments into one line.
+        models = _merge_family(segments[keep], target, mask)
+        for index, line in enumerate(models):
+            supporting = int(keep.sum())
+            fitted.append({"index": len(fitted), "family_index": index,
+                           "image_points": line.tolist(), "kind": kind,
+                           "supporting_fragments": supporting,
+                           "length_pixels": float(np.linalg.norm(line[1] - line[0])),
+                           "angle_degrees": float(np.degrees(target))})
+    return {"raw_count": int(len(segments)), "fitted": fitted}
 
 
 def describe_field_detections(video_path: Path, timestamp_s: float, reader=None) -> dict:
@@ -766,7 +767,8 @@ def describe_field_detections(video_path: Path, timestamp_s: float, reader=None)
         number_rows = [None] * len(raw_numbers)
     return {
         "frame_width": int(width), "frame_height": int(height),
-        "line_evidence": line_evidence,
+        "line_evidence": line_evidence["fitted"],
+        "raw_line_fragment_count": line_evidence["raw_count"],
         "lines": [{"index": index,
                    "image_points": [[float(point[0]), float(point[1])] for point in line],
                    "assigned_field_x": assigned[index]}

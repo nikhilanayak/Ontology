@@ -28,14 +28,12 @@ function currentRows() {
 function matrixAt(timestamp){
   const keys=state.calibrationMatrices;
   if(!keys.length)return null;
-  if(timestamp<=keys[0].timestamp_s)return keys[0].matrix;
-  if(timestamp>=keys.at(-1).timestamp_s)return keys.at(-1).matrix;
-  let i=0;while(i<keys.length-1&&keys[i+1].timestamp_s<timestamp)i++;
-  const a=keys[i],b=keys[i+1],span=b.timestamp_s-a.timestamp_s;
-  if(span<=0)return a.matrix;
-  const f=(timestamp-a.timestamp_s)/span;
-  const m=a.matrix.map((row,r)=>row.map((v,c)=>(1-f)*v+f*b.matrix[r][c]));
-  const s=m[2][2]||1;return m.map(row=>row.map(v=>v/s));
+  // A homography is projective geometry, not an array of independent numbers.
+  // Element-wise interpolation can become singular and make the grid fly across
+  // the image. Until temporal registration produces a matrix at this exact
+  // frame, show the nearest verified keyframe honestly rather than inventing a
+  // matrix that was never calibrated.
+  return keys.reduce((best,key)=>Math.abs(key.timestamp_s-timestamp)<Math.abs(best.timestamp_s-timestamp)?key:best).matrix;
 }
 function invert3(m){
   const [[a,b,c],[d,e,f],[g,h,i]]=m;
@@ -130,7 +128,7 @@ function drawOverlay(rows) {
           x.fillText(`${line.kind} ${line.length_pixels.toFixed(0)}px`,(a[0]+b[0])/2,(a[1]+b[1])/2);
         }
       }
-      notes.push(`${(debug.line_evidence||[]).length} all line candidates`);
+      notes.push(`${(debug.line_evidence||[]).length} fitted candidates from ${debug.raw_line_fragment_count||0} raw fragments`);
     }
     if(layerOn('layer-lines')){
       x.lineWidth=3;
