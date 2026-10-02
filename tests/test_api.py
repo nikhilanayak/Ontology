@@ -171,3 +171,61 @@ def test_calibration_exposes_matrix_and_detections_endpoint(tmp_path: Path):
     assert {"x1", "y1", "x2", "y2", "video_timestamp"} <= set(rows[0])
     assert client.get("/api/clips/c1/detections", params={"stride": 2}).json() == [rows[0]]
     assert client.get("/api/clips/missing/detections").status_code == 404
+
+
+def test_hough_preview_endpoints(tmp_path: Path):
+    """The Hough preview lists shots, returns raw segments, and renders a JPEG."""
+    import cv2
+    import numpy as np
+
+    database = tmp_path / "hough.sqlite3"
+    initialize(database)
+    height, width = 360, 640
+    frame = np.full((height, width, 3), (60, 140, 70), dtype=np.uint8)
+    for x in range(80, width - 40, 90):
+        cv2.line(frame, (x, 30), (x, height - 30), (245, 245, 245), 3)
+    video = tmp_path / "film.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (width, height))
+    for _ in range(20):
+        writer.write(frame)
+    writer.release()
+    if not video.exists():  # codec unavailable in this environment
+        return
+    with transaction(database) as connection:
+        connection.execute("INSERT INTO games(game_id,video_path) VALUES('g',?)", (str(video),))
+        connection.execute("INSERT INTO games(game_id,video_path) VALUES('nofilm',NULL)")
+        connection.execute(
+            """INSERT INTO clips(clip_id,game_id,angle,start_s,end_s,confidence)
+               VALUES('c1','g','sideline',0,1.5,.9)""")
+        connection.execute(
+            """INSERT INTO clips(clip_id,game_id,angle,start_s,end_s,confidence)
+               VALUES('c2','nofilm','endzone',0,1.5,.9)""")
+    client = TestClient(create_app(database, tmp_path / "trajectories", None))
+
+    listed = client.get("/api/hough/clips").json()
+    assert [clip["clip_id"] for clip in listed] == ["c1"]
+    assert listed[0]["angle"] == "sideline"
+    assert client.get("/api/hough/clips", params={"game_id": "nofilm"}).json() == []
+
+    response = client.get("/api/hough/clips/c1/lines", params={"timestamp_s": .5})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["clip_id"] == "c1" and payload["timestamp_s"] == .5
+    assert payload["width"] == width and payload["height"] == height
+    assert payload["count"] == len(payload["segments"]) > 0
+    assert {"x1", "y1", "x2", "y2", "length", "angle"} == set(payload["segments"][0])
+    assert payload["parameters"]["threshold"] == 45
+
+    strict = client.get("/api/hough/clips/c1/lines",
+                        params={"timestamp_s": .5, "min_line_length": 2000}).json()
+    assert strict["count"] == 0
+    assert strict["parameters"]["min_line_length"] == 2000
+
+    image = client.get("/api/hough/clips/c1/annotated.jpg", params={"timestamp_s": .5})
+    assert image.status_code == 200
+    assert image.headers["content-type"] == "image/jpeg"
+    assert image.content[:2] == b"\xff\xd8"
+
+    assert client.get("/api/hough/clips/missing/lines").status_code == 404
+    assert client.get("/api/hough/clips/c2/lines").status_code == 404
+    assert client.get("/api/hough/clips/c1/lines", params={"timestamp_s": 99}).status_code == 422

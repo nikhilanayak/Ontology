@@ -320,3 +320,25 @@ verified bit-identical on 180 real grid points (max abs difference `0.000e+00`).
 4. Keep all detection/reconstruction work bounded (`--clip-id` preferred, otherwise a small `--limit`). Do **not** start a full-game or full-season run.
 
 Canonical test, deployment, bounded experiment, and server-restart commands are maintained in `AGENTS.md`. Update this file immediately after the next experiment or deployment with the exact commit, command, source set, artifact path, and metrics.
+
+## Standalone Hough line preview (local, uncommitted — 2026-10-02)
+
+The prior calibration/tracking direction is paused. A new standalone experiment now applies only
+generic Canny edge detection and `cv2.HoughLinesP` to a decoded video frame, then draws every raw
+segment coloured by orientation. It deliberately has no field mask, line clustering, yard-line
+interpretation, calibration, detection, or tracking dependency.
+
+- Local implementation: `src/all22/hough.py`; preview at `/hough`; API routes under `/api/hough/`;
+  controls expose frame time, blur, Canny thresholds, Hough threshold, minimum line length,
+  maximum gap, line thickness, raw edges, and line visibility.
+- Local verification: `.venv/bin/python -m pytest -q` — **106 passed**, one existing
+  `StarletteDeprecationWarning` (2026-10-02).
+- End-to-end synthetic verification: `/hough`, JS/CSS assets, line JSON, annotated JPEG,
+  edge-only image, missing-video errors, and timestamp bounds all passed through FastAPI's test client.
+- Bounded production-data probe (no deployment): copied only `src/all22/hough.py` to ignored
+  `.runtime/hough_preview_probe.py` and sampled `start_s + 0.3` for clips `0005`, `0013`, and `0295`
+  from both registered games. All six 1920x1080 frames decoded and rendered. Raw line counts were
+  Bills-Rams: **518 / 489 / 479**; Lions-Chiefs: **988 / 859 / 559**. Generated probe JPEGs remain
+  private under production `.runtime/`; no footage or derived image entered Git.
+- Deployment state: **local only, uncommitted, not deployed**. The unrelated pre-existing local
+  modification in `src/all22/field_registration.py` was preserved and not touched by this work.

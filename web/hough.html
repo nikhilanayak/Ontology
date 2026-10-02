@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hough line preview</title>
+  <link rel="stylesheet" href="/assets/hough.css">
+</head>
+<body>
+  <header>
+    <h1>Hough line preview</h1>
+    <span id="status">Loading…</span>
+  </header>
+  <main>
+    <aside>
+      <label>Game
+        <select id="games"></select>
+      </label>
+      <label>Shot
+        <select id="clips"></select>
+      </label>
+
+      <div class="field">
+        <label for="time">Time in shot <output id="time-value"></output></label>
+        <input type="range" id="time" min="0" max="1" step="0.04" value="0">
+        <div class="stepper">
+          <button data-step="-1">&minus;1 frame</button>
+          <button data-step="1">+1 frame</button>
+        </div>
+      </div>
+
+      <fieldset>
+        <legend>Edges (Canny)</legend>
+        <label class="slider">Blur <output data-for="blur"></output>
+          <input type="range" id="blur" min="0" max="15" step="2" value="5">
+        </label>
+        <label class="slider">Low threshold <output data-for="canny_low"></output>
+          <input type="range" id="canny_low" min="0" max="300" step="5" value="50">
+        </label>
+        <label class="slider">High threshold <output data-for="canny_high"></output>
+          <input type="range" id="canny_high" min="1" max="500" step="5" value="150">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Hough transform</legend>
+        <label class="slider">Accumulator threshold <output data-for="threshold"></output>
+          <input type="range" id="threshold" min="1" max="300" step="1" value="45">
+        </label>
+        <label class="slider">Minimum line length <output data-for="min_line_length"></output>
+          <input type="range" id="min_line_length" min="1" max="600" step="5" value="60">
+        </label>
+        <label class="slider">Maximum line gap <output data-for="max_line_gap"></output>
+          <input type="range" id="max_line_gap" min="0" max="200" step="1" value="35">
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Drawing</legend>
+        <label class="slider">Line thickness <output data-for="thickness"></output>
+          <input type="range" id="thickness" min="1" max="8" step="1" value="2">
+        </label>
+        <label class="check"><input type="checkbox" id="draw_lines" checked> Draw detected lines</label>
+        <label class="check"><input type="checkbox" id="show_edges"> Show Canny edges</label>
+      </fieldset>
+
+      <button id="reset" type="button">Reset parameters</button>
+      <p class="note">Lines are coloured by orientation, so parallel families share a hue.
+        This is the raw probabilistic Hough transform on the whole frame: no field mask,
+        no clustering, and no yard-line interpretation.</p>
+    </aside>
+
+    <section class="stage">
+      <div class="frame-wrap">
+        <img id="frame" alt="Annotated frame">
+        <div id="spinner" hidden></div>
+      </div>
+      <div id="stats" class="stats"></div>
+      <details class="histogram-box">
+        <summary>Orientation histogram</summary>
+        <div id="histogram"></div>
+      </details>
+    </section>
+  </main>
+  <script src="/assets/hough.js"></script>
+</body>
+</html>

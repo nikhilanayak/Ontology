@@ -4,13 +4,14 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import field_registration, field_tracking, workflow
+from . import field_registration, field_tracking, hough, workflow
 from .db import connect, transaction
 
 
@@ -447,6 +448,100 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             raise HTTPException(500, "Could not encode the frame")
         return Response(content=buffer.tobytes(), media_type="image/jpeg")
 
+    def _hough_clip_frame(clip_id: str, timestamp_s: Optional[float]):
+        """Decode one frame of a shot for the Hough preview, with its shot bounds."""
+        import cv2
+
+        with connect(db_path) as connection:
+            clip = connection.execute(
+                """SELECT c.start_s,c.end_s,c.angle,g.video_path FROM clips c
+                   JOIN games g ON g.game_id=c.game_id WHERE c.clip_id=?""", (clip_id,),
+            ).fetchone()
+        if not clip:
+            raise HTTPException(404, "Source clip not found")
+        if not clip["video_path"]:
+            raise HTTPException(404, "Video not registered")
+        path = Path(clip["video_path"])
+        if not path.is_file():
+            raise HTTPException(404, "Video file missing")
+        start, end = float(clip["start_s"]), float(clip["end_s"])
+        when = start if timestamp_s is None else float(timestamp_s)
+        if not start <= when <= end:
+            raise HTTPException(422, f"Timestamp must lie inside the shot ({start:.2f}-{end:.2f}s)")
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            raise HTTPException(422, "Could not open the film")
+        try:
+            capture.set(cv2.CAP_PROP_POS_MSEC, when * 1000)
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        if not ok:
+            raise HTTPException(422, f"Could not decode a frame at {when:.2f}s")
+        return frame, {"clip_id": clip_id, "angle": clip["angle"], "start_s": start,
+                       "end_s": end, "timestamp_s": when}
+
+    def _hough_parameters(blur: int, canny_low: int, canny_high: int, threshold: int,
+                          min_line_length: int, max_line_gap: int) -> "hough.HoughParameters":
+        return hough.HoughParameters(
+            blur=blur, canny_low=canny_low, canny_high=canny_high, threshold=threshold,
+            min_line_length=min_line_length, max_line_gap=max_line_gap,
+        ).normalized()
+
+    @app.get("/api/hough/clips")
+    def hough_clips(game_id: Optional[str] = None, limit: int = Query(2000, ge=1, le=2000)):
+        """List shots that the Hough preview can draw frames from."""
+        with connect(db_path) as connection:
+            if game_id:
+                rows = connection.execute(
+                    """SELECT c.clip_id,c.game_id,c.angle,c.start_s,c.end_s FROM clips c
+                       JOIN games g ON g.game_id=c.game_id
+                       WHERE c.game_id=? AND g.video_path IS NOT NULL
+                       ORDER BY c.start_s LIMIT ?""", (game_id, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT c.clip_id,c.game_id,c.angle,c.start_s,c.end_s FROM clips c
+                       JOIN games g ON g.game_id=c.game_id WHERE g.video_path IS NOT NULL
+                       ORDER BY c.game_id,c.start_s LIMIT ?""", (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    @app.get("/api/hough/clips/{clip_id}/lines")
+    def hough_lines(clip_id: str, timestamp_s: Optional[float] = None,
+                    blur: int = Query(5, ge=0, le=31),
+                    canny_low: int = Query(50, ge=0, le=500),
+                    canny_high: int = Query(150, ge=1, le=1000),
+                    threshold: int = Query(45, ge=1, le=500),
+                    min_line_length: int = Query(60, ge=1, le=2000),
+                    max_line_gap: int = Query(35, ge=0, le=500)):
+        """Return raw Hough segments for one frame, with no field interpretation."""
+        frame, meta = _hough_clip_frame(clip_id, timestamp_s)
+        parameters = _hough_parameters(blur, canny_low, canny_high, threshold,
+                                       min_line_length, max_line_gap)
+        return {**meta, **hough.describe(frame, parameters)}
+
+    @app.get("/api/hough/clips/{clip_id}/annotated.jpg")
+    def hough_annotated(clip_id: str, timestamp_s: Optional[float] = None,
+                        blur: int = Query(5, ge=0, le=31),
+                        canny_low: int = Query(50, ge=0, le=500),
+                        canny_high: int = Query(150, ge=1, le=1000),
+                        threshold: int = Query(45, ge=1, le=500),
+                        min_line_length: int = Query(60, ge=1, le=2000),
+                        max_line_gap: int = Query(35, ge=0, le=500),
+                        thickness: int = Query(2, ge=1, le=10),
+                        show_edges: bool = False, draw_lines: bool = True):
+        """Return the frame with Hough segments drawn over it as a JPEG."""
+        frame, _ = _hough_clip_frame(clip_id, timestamp_s)
+        parameters = _hough_parameters(blur, canny_low, canny_high, threshold,
+                                       min_line_length, max_line_gap)
+        segments = hough.detect_lines(frame, parameters) if draw_lines \
+            else np.empty((0, 4), dtype=np.int32)
+        image = hough.annotate(frame, segments, thickness=thickness,
+                               show_edges=show_edges, parameters=parameters)
+        return Response(content=hough.encode_jpeg(image), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
     @app.get("/api/video/{game_id}")
     def video(game_id: str):
         with connect(db_path) as connection:
@@ -464,5 +559,9 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
         @app.get("/")
         def index():
             return FileResponse(static_dir / "index.html", headers={"Cache-Control": "no-store"})
+
+        @app.get("/hough")
+        def hough_preview():
+            return FileResponse(static_dir / "hough.html", headers={"Cache-Control": "no-store"})
 
     return app
