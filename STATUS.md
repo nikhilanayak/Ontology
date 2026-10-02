@@ -49,6 +49,8 @@ These files are private, ignored evaluation artifacts under `data/`; record thei
 | 64d embedding, same evaluator | `data/bdb-audited-evaluation-embed64.json` | purity `0.4948`; switches/100 `28.8862`; refined error `2.66625 yd`; coverage `0.6638` |
 | Latest separated evaluator, 18 sources | `data/bdb-audited-evaluation-embed64-separated.json` | raw error `5.2657 yd`; coverage `0.76317`; refined error `2.92556 yd`; purity `0.48576`; switches/100 `29.8966` |
 | **Protocol baseline** (`14ffe8f`, protocol `cf167f0e…b9e2ae`, 18 sources) | `data/evaluations/bills-at-rams-2022-reg-1/baseline-14ffe8f.json` | raw error `5.26572 yd`; coverage `0.76317`; refined error `2.92556 yd`; purity `0.48576`; switches/100 `29.8966`; `drift_allowed: false`; `input_drift: []` |
+| Phase 1 as first written (`55dbd92`) | `data/evaluations/bills-at-rams-2022-reg-1/phase1-55dbd92.json` | purity `0.4580`; switches/100 `32.18` — **worse**, reverted in part (see ablation) |
+| Phase 1 kept + r2 detector (`d572544`+) | `data/evaluations/bills-at-rams-2022-reg-1/phase1-4-r2.json` | coverage `0.7735` (**+0.010**); purity `0.4764`; switches/100 `30.95`; raw `5.5453 yd`; refined `3.0456 yd`; `drift_allowed: true` (detections intentionally changed) |
 
 The latest separated-evaluator result is **not spatially comparable** to the two earlier runs because the evaluator and observation/identity separation changed. Do not characterize its raw/refined spatial movement as a regression or improvement without an apples-to-apples rerun.
 
@@ -80,9 +82,100 @@ Selected latest per-source results:
 | `0278` | `0.54915` | `20.85` | `4.05` | `6.8855` |
 | `0295` | `0.41793` | `37.25` | `11.13` | `5.6641` |
 
+## Detection/tracking quality investigation (2026-10-02)
+
+Measured on production against the frozen protocol. **Read this before tuning anything.**
+
+### Where players are actually lost
+
+| Stage | Players/frame (median of 18) |
+|---|---:|
+| BDB truth | 22 |
+| Detections (old, threshold .35) | 20.7 |
+| Survive `on_field` + `calibration_valid` | 18.7 |
+| In tracks | 18.7 |
+| Marked `track_reliable` | 15.2 |
+
+The detector is **not** the main bottleneck: on clip `0005` it already returns 22–26 people per
+frame, median box height is 74–245 px, and only ~3% of boxes are under 40 px. Raising inference
+resolution to native 1080p changed per-frame counts from `[22,22,22,24]` to `[22,22,21,24]`;
+1440p added ~2. Median raw track count was **42 IDs per clip for 22 players** (175 on `0009`).
+
+### What was tried, and what it measured
+
+Ablation on the frozen protocol (baseline purity `.4858`, switches `29.90`):
+
+| Variant | Purity | Switches/100 |
+|---|---:|---:|
+| Deterministic team anchor only | `.4675` | `28.42` |
+| + play-span reliability denominator | `.4618` | `31.88` |
+| + snap line-of-scrimmage naming | `.4618` | `31.88` (inert) |
+| + officials cluster cap `.30` | `.4580` | `32.18` |
+
+**Kept:** the deterministic anchor and per-track team resolution. Tracking used to read
+`action_windows.snap_s`, which action discovery writes *after* tracking, so a clip's first
+reconstruction differed from every later one (verified: clip `0004` went from
+`{team_1: 1157, team_0: 738}` to `{team_0: 688, team_1: 672, official: 444}` on re-run).
+
+**Reverted as measured-harmful:** the play-span reliability denominator (admits marginal
+tracklets whose fragmentation costs more than the recovered part-time players) and the relaxed
+officials cap (mislabelled 16 of 27 reliable tracks as officials on `0009`, poisoning the
+team-mismatch penalty).
+
+### Confirmed root cause of the coverage ceiling
+
+The `.35` detection threshold was **baked into the artifacts**, so the weak-detection tier the
+two-stage associator needs was discarded before tracking. Proof: sweeping the tracker birth
+threshold over `.55/.45/.35` was *exactly* inert (identical metrics to 4 dp) because nothing
+below `.35` existed. Re-detecting at threshold `.15`, native 1080p, fp16, batch 4 gives ~19%
+more detections per frame with an 8–11% weak tier, at ~17 s/clip, and lifted coverage
+`0.7632 → 0.7735`. Detections live at `data/detections-r2/` (`model_version` now records
+revision, resolution, and precision).
+
+### The identity metric is partly measuring itself
+
+`EVALUATOR_PARAMETERS.identity_maximum_error_yards` is `8.0`, which is wider than the spacing
+between players. Tightening the gate alone, with **no tracking change**, moves purity a lot:
+
+| Gate | `0005` purity | `0010` purity |
+|---|---:|---:|
+| 8.0 yd (current) | `.457` | `.297` |
+| 4.0 yd | `.582` | `.325` |
+| 2.0 yd | `.623` | `.376` |
+| 1.5 yd | `.677` | `.420` |
+
+At 8 yd the Hungarian force-matches players several positions away, manufacturing apparent
+switches. Clip `0005` is close to correct (22 reliable tracks/frame, one row per track per
+frame) yet scores `.457`; `0010` stays poor at every gate and has a genuine tracking fault.
+**Any future purity number must state its gate.** Changing the gate requires an
+`EVALUATOR_VERSION` bump and a protocol re-freeze.
+
+### Global (offline) association
+
+Implemented in `associate_tracklets_globally`: tracklets overlapping in time cannot be the same
+player, and a player can only travel so far across a gap. It makes 37 links over 999 tracks and
+moves switches `31.37 → 30.95` with purity unchanged — small, because track lifetimes are
+already ~5.15 s of a ~7.0 s window. Fragmentation of 5–13 per player therefore comes mostly from
+the 8 yd matching gate, not from short tracklets.
+
+### Evaluator is 11x faster
+
+94% of evaluation time was pandas column indexing inside the 64-point alignment grid. Grouping
+positions and truth into numpy once per source cut a full 18-source run from **62.6 s to 5.8 s**,
+verified bit-identical on 180 real grid points (max abs difference `0.000e+00`).
+
 ## Immediate next work
 
-1. Tune embedding association on a small explicit clip set (`0005`, `0278`, `0295`) without losing good spatial tracks. Re-run `reconstruct-clip` for those clips only, then score with `--protocol`. Treat identity purity/switches and spatial error/coverage as separate paired outcomes; each tracker variant has a distinct `config_hash`.
+1. **Fix the identity metric before tuning further.** Bump `EVALUATOR_VERSION`, set
+   `identity_maximum_error_yards` to ~2 yd (or make matching mutual-nearest-neighbour), re-freeze,
+   and re-establish the baseline. Purity differences under the current 8 yd gate are not
+   trustworthy, and parameter sweeps against it overfit: `hc.35`+`aw.3` scored `.459` while
+   `aw.3` alone scored `.503` on the same tracks.
+2. Hold out a validation subset of the 18 sources. Every number above is a median over the same
+   18 clips used for tuning, so the smaller deltas are inside the noise.
+3. Tune embedding association on `0010`/`0007`/`0009` (worst purity at every gate, so genuinely
+   broken rather than mis-measured) without losing good spatial tracks. Each tracker variant has a
+   distinct `config_hash`.
 2. Improve field-boundary estimation and homography robustness, especially on the three weak example sources above. Note that re-calibrating a clip changes its calibration revision and will (correctly) trip protocol drift; re-freeze deliberately when that is the intent.
 3. Validate changes on additional bounded clips only after the explicit pilot clips improve or reveal a stable tradeoff.
 4. Keep all detection/reconstruction work bounded (`--clip-id` preferred, otherwise a small `--limit`). Do **not** start a full-game or full-season run.
