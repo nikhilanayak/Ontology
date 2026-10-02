@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -71,18 +72,33 @@ class BoxTracker:
 
 
 class TorchvisionPersonDetector:
-    model_version = "torchvision:fasterrcnn_resnet50_fpn_v2:coco+resnet18:imagenet:embed64"
+    """Person detector for All-22 film.
 
-    def __init__(self, device: Optional[str] = None, threshold: float = 0.35):
+    Runs at native 1080p in fp16 and keeps a low-score tier. The two-stage
+    associator needs weak detections to recover occluded players, so the
+    detection threshold must stay below the tracker's birth threshold; a .35
+    cut baked into the artifact cannot be undone later.
+    """
+
+    detector_revision = "r2"
+
+    def __init__(self, device: Optional[str] = None, threshold: float = .15,
+                 minimum_size: int = 1080, maximum_size: int = 1920,
+                 half: bool = True, batch_size: int = 4):
         import torch
         from torchvision.models import ResNet18_Weights, resnet18
         from torchvision.models.detection import FasterRCNN_ResNet50_FPN_V2_Weights, fasterrcnn_resnet50_fpn_v2
 
         self.torch = torch
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.half = bool(half) and self.device.type == "cuda"
+        self.batch_size = max(1, int(batch_size))
+        self.minimum_size, self.maximum_size = int(minimum_size), int(maximum_size)
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
         self.transform = weights.transforms()
-        self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(self.device).eval()
+        self.model = fasterrcnn_resnet50_fpn_v2(
+            weights=weights, min_size=self.minimum_size, max_size=self.maximum_size,
+        ).to(self.device).eval()
         appearance_weights = ResNet18_Weights.DEFAULT
         self.appearance_transform = appearance_weights.transforms()
         self.appearance_model = resnet18(weights=appearance_weights).to(self.device).eval()
@@ -92,15 +108,38 @@ class TorchvisionPersonDetector:
         self.appearance_projection = torch.from_numpy(projection).to(self.device)
         self.threshold = threshold
 
-    def predict(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    @property
+    def model_version(self) -> str:
+        precision = "fp16" if self.half else "fp32"
+        return ("torchvision:fasterrcnn_resnet50_fpn_v2:coco+resnet18:imagenet:embed64"
+                f":{self.detector_revision}:{self.minimum_size}x{self.maximum_size}:{precision}")
+
+    def _autocast(self):
+        if self.half:
+            return self.torch.autocast("cuda", dtype=self.torch.float16)
+        return contextlib.nullcontext()
+
+    def _tensor(self, frame: np.ndarray):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(self.torch.from_numpy(rgb).permute(2, 0, 1)).to(self.device)
-        with self.torch.inference_mode():
-            result = self.model([tensor])[0]
-        keep = (result["labels"] == 1) & (result["scores"] >= self.threshold)
-        boxes = result["boxes"][keep].detach().cpu().numpy()
-        scores = result["scores"][keep].detach().cpu().numpy()
-        return boxes, scores
+        return self.transform(self.torch.from_numpy(rgb).permute(2, 0, 1)).to(self.device)
+
+    def predict_batch(self, frames: list) -> list:
+        """Detect people in several frames at once to keep the GPU busy."""
+        if not frames:
+            return []
+        results = []
+        for start in range(0, len(frames), self.batch_size):
+            chunk = [self._tensor(frame) for frame in frames[start:start + self.batch_size]]
+            with self.torch.inference_mode(), self._autocast():
+                outputs = self.model(chunk)
+            for output in outputs:
+                keep = (output["labels"] == 1) & (output["scores"] >= self.threshold)
+                results.append((output["boxes"][keep].float().detach().cpu().numpy(),
+                                output["scores"][keep].float().detach().cpu().numpy()))
+        return results
+
+    def predict(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return self.predict_batch([frame])[0]
 
     def encode(self, frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
         crops = []
@@ -116,11 +155,11 @@ class TorchvisionPersonDetector:
             crops.append(self.appearance_transform(self.torch.from_numpy(crop).permute(2, 0, 1)))
         if not crops:
             return np.empty((0, 64), dtype=np.float32)
-        with self.torch.inference_mode():
+        with self.torch.inference_mode(), self._autocast():
             features = self.appearance_model(self.torch.stack(crops).to(self.device))
-            features = features @ self.appearance_projection
+            features = features.float() @ self.appearance_projection
             features = self.torch.nn.functional.normalize(features, dim=1)
-        return features.detach().cpu().numpy()
+        return features.float().detach().cpu().numpy()
 
 
 def _appearance_features(frame: np.ndarray, box: np.ndarray) -> dict:
@@ -185,12 +224,13 @@ def _config_hash(value: dict) -> str:
 
 
 def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10.0,
-                threshold: float = .35, device: Optional[str] = None, detector=None) -> int:
+                threshold: float = .15, device: Optional[str] = None, detector=None,
+                batch_size: int = 4) -> int:
     """Detect people in one hard-cut-bounded shot, independent of PBP alignment."""
     if sample_hz <= 0:
         raise ValueError("sample_hz must be positive")
     source = _clip_record(db_path, clip_id)
-    detector = detector or TorchvisionPersonDetector(device, threshold)
+    detector = detector or TorchvisionPersonDetector(device, threshold, batch_size=batch_size)
     capture = cv2.VideoCapture(source["video_path"])
     if not capture.isOpened():
         raise ValueError(f"Could not open {source['video_path']}")
@@ -199,6 +239,34 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
     capture.set(cv2.CAP_PROP_POS_MSEC, float(source["start_s"]) * 1000)
     records = []
     decoded = sample_index = 0
+    pending: list[tuple[float, np.ndarray]] = []
+    batched = getattr(detector, "predict_batch", None)
+    width = max(1, int(batch_size) if batched else 1)
+
+    def flush() -> None:
+        nonlocal sample_index, pending
+        if not pending:
+            return
+        frames = [frame for _, frame in pending]
+        results = batched(frames) if batched else [detector.predict(frame) for frame in frames]
+        for (timestamp, frame), (boxes, scores) in zip(pending, results):
+            boxes, scores = _on_field_detections(frame, boxes, scores)
+            embeddings = detector.encode(frame, boxes) if hasattr(detector, "encode") else None
+            for detection_index, (box, score) in enumerate(zip(boxes, scores)):
+                x1, y1, x2, y2 = (float(value) for value in box)
+                records.append({"game_id": source["game_id"], "clip_id": clip_id,
+                                "frame_id": sample_index, "video_timestamp": timestamp,
+                                "detection_id": detection_index, "x1": x1, "y1": y1,
+                                "x2": x2, "y2": y2, "contact_x": (x1 + x2) / 2,
+                                "contact_y": y2, "confidence": float(score),
+                                "model_version": detector.model_version,
+                                **_appearance_features(frame, np.asarray(box)),
+                                **({f"emb_{column:02d}": float(value)
+                                    for column, value in enumerate(embeddings[detection_index])}
+                                   if embeddings is not None else {})})
+            sample_index += 1
+        pending = []
+
     try:
         while True:
             ok, frame = capture.read()
@@ -208,23 +276,11 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
             if timestamp > float(source["end_s"]):
                 break
             if decoded % every == 0:
-                boxes, scores = detector.predict(frame)
-                boxes, scores = _on_field_detections(frame, boxes, scores)
-                embeddings = detector.encode(frame, boxes) if hasattr(detector, "encode") else None
-                for detection_index, (box, score) in enumerate(zip(boxes, scores)):
-                    x1, y1, x2, y2 = (float(value) for value in box)
-                    records.append({"game_id": source["game_id"], "clip_id": clip_id,
-                                    "frame_id": sample_index, "video_timestamp": timestamp,
-                                    "detection_id": detection_index, "x1": x1, "y1": y1,
-                                    "x2": x2, "y2": y2, "contact_x": (x1 + x2) / 2,
-                                    "contact_y": y2, "confidence": float(score),
-                                    "model_version": detector.model_version,
-                                    **_appearance_features(frame, np.asarray(box)),
-                                    **({f"emb_{column:02d}": float(value)
-                                        for column, value in enumerate(embeddings[detection_index])}
-                                       if embeddings is not None else {})})
-                sample_index += 1
+                pending.append((timestamp, frame))
+                if len(pending) >= width:
+                    flush()
             decoded += 1
+        flush()
     finally:
         capture.release()
     if not records:
@@ -245,9 +301,9 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
 
 
 def detect_clips(db_path: Path, game_id: str, output_dir: Path, sample_hz: float = 10.0,
-                 threshold: float = .35, device: Optional[str] = None,
+                 threshold: float = .15, device: Optional[str] = None,
                  clip_ids: Optional[list[str]] = None, limit: Optional[int] = None,
-                 resume: bool = True, detector=None) -> list[dict]:
+                 resume: bool = True, detector=None, batch_size: int = 4) -> list[dict]:
     """Batch clip detection while loading the model only once."""
     with connect(db_path) as connection:
         available = connection.execute(
@@ -261,14 +317,15 @@ def detect_clips(db_path: Path, game_id: str, output_dir: Path, sample_hz: float
         if limit < 1:
             raise ValueError("limit must be positive")
         selected = selected[:limit]
-    detector = detector or TorchvisionPersonDetector(device, threshold)
+    detector = detector or TorchvisionPersonDetector(device, threshold, batch_size=batch_size)
     results = []
     for clip_id in selected:
         output = output_dir / game_id / f"{clip_id}.parquet"
         if resume and output.exists():
             results.append({"clip_id": clip_id, "output": str(output), "status": "cached"})
             continue
-        rows = detect_clip(db_path, clip_id, output, sample_hz, threshold, device, detector)
+        rows = detect_clip(db_path, clip_id, output, sample_hz, threshold, device, detector,
+                           batch_size=batch_size)
         results.append({"clip_id": clip_id, "output": str(output), "status": "created", "rows": rows})
     return results
 

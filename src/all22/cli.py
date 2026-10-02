@@ -104,7 +104,10 @@ def parser() -> argparse.ArgumentParser:
     detect_clips.add_argument("--game-id", required=True)
     detect_clips.add_argument("--clip-id", action="append", dest="clip_ids")
     detect_clips.add_argument("--sample-hz", type=float, default=10.0)
-    detect_clips.add_argument("--threshold", type=float, default=.35)
+    detect_clips.add_argument("--threshold", type=float, default=.15,
+                              help="Keep a low-score tier; the tracker needs weak detections "
+                                   "to recover occluded players")
+    detect_clips.add_argument("--batch-size", type=int, default=4)
     detect_clips.add_argument("--device")
     detect_clips.add_argument("--limit", type=int)
     detect_clips.add_argument("--no-resume", action="store_true")
@@ -326,6 +329,7 @@ def main() -> None:
         results = tracking.detect_clips(
             args.db, args.game_id, args.output_dir, args.sample_hz, args.threshold,
             args.device, args.clip_ids, args.limit, not args.no_resume,
+            batch_size=args.batch_size,
         )
         print(json.dumps({"game_id": args.game_id, "clips": len(results), "results": results}, indent=2))
     elif args.command == "project-source":
