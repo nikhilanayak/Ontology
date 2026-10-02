@@ -82,6 +82,76 @@ Selected latest per-source results:
 | `0278` | `0.54915` | `20.85` | `4.05` | `6.8855` |
 | `0295` | `0.41793` | `37.25` | `11.13` | `5.6641` |
 
+## Objective narrowed to formation analysis (2026-10-02)
+
+The goal is reading **pre-snap formations** and following **important players through a route**.
+Inch-level accuracy inside a tackle pile is explicitly not required. That reframing matters,
+because whole-play HOTA is dominated by the pile — the hardest and least relevant regime.
+
+Three targets were set and measured. Protocol `c5a8cde0…`, r2 detections, `411c03d`+.
+
+| Metric | Validation (9) | Test (9) |
+|---|---:|---:|
+| Snap-frame recall of 22 players | **98.8%** | 81.8% |
+| Isolated-player recall (route runners) | **97.5%** | 75.7% |
+| Snap median error | 2.13 yd | 2.19 yd |
+| Snap players within 1 yd | 18.7% | 22.4% |
+| HOTA / DetA / LocA | .125 / .123 / .769 | .118 / .111 / .761 |
+
+Best clip (`0013`): **1.06 yd median, 45% within 1 yd, 99.2% snap recall** — already
+formation-grade. Worst (`0295`, `0277`): 7.17 and 5.26 yd. The spread across clips, not the
+average, is the problem.
+
+### Goal 2 — losing route runners: largely fixed
+
+The on-field test was a hard `0 <= y <= 53.333` box with no tolerance, while our own calibration
+is several yards out. On clip `0003`, **98.4% of dropped detections failed only on `field_y`,
+at a median of 2.2 yd outside the sideline** — split receivers and gunners, precisely the route
+runners of interest. Measured before the fix: only **33%** of isolated truth players (>5 yd from
+anyone) had any prediction within 2 yd, versus 80–90% for players in formation. Isolated players
+scored *worse* than players in a pile (7.08 vs 2.29 yd), which is backwards for a localization
+problem and was the clue.
+
+Admitting a calibration-scaled margin (3 yd, capped at 8, scaled by the frame's p95) lifted
+isolated recall from ~33% to **97.5%** on validation. The margin does not manufacture ghosts:
+out-of-bounds detections are 0–9% of reliable track rows on most clips.
+
+### Goal 1 — recognizing calibration position: verification added, accuracy still open
+
+Calibration's own residuals are **uncorrelated with real error** (|r| < 0.17 across 15 clips on
+keyframe count, density, p95 and inlier ratio). Clip `0007` reported a **0.22 yd p95 while
+sitting 5.92 yd out**: the homography fits the lines it was handed and is placed on the wrong
+yard lines. A rigid shift of the whole formation removes much of the error (`0007` 5.92 → 2.52 yd
+with a −5.83 yd y-shift; `0295` 8.08 → 6.13 with a −5.16 yd x-shift), confirming the formation
+*shape* is roughly right but globally mislocated.
+
+`verify_registration` now checks the result against field geometry — scale in px/yd, frame span,
+overlap with the field, skew, degeneracy — and zeroes confidence when implausible, so a
+confidently wrong fit fails closed instead of propagating. This catches absurd fits; it does
+**not** yet resolve the 5-yard-periodic ambiguity, which is the remaining accuracy gap.
+
+### Goal 3 — generic team identification: reworked to be matchup-independent
+
+Team assignment was k-means on LAB/HSV with hand-tuned scales and a colour-based seed, which
+cannot transfer to new teams, lighting or kit pairings. It is now **decided by formation
+geometry**: at the snap the two units occupy disjoint ranges of `field_x`, which separates them
+perfectly in BDB truth regardless of who is playing. Appearance is then learned *per clip* from
+those geometrically-defined sides to label players the snap could not see, and an ambiguous
+uniform stays `unknown` rather than guessing. Tested across three unrelated uniform pairings
+including two visually similar light kits.
+
+Team balance is still wrong on the over-tracked clips (`0277` 31 v 6, `0295` 30 v 7) because
+those clips produce 37 reliable tracks for 22 players. That is fragmentation, not a team bug.
+
+### What remains
+
+Localization is the binding constraint for formation accuracy: snap recall is ~99% but only
+~19% of players land within 1 yd. Established earlier, and unchanged: a **perfect per-frame
+homography fitted to the answers** still leaves 2.11 yd median, so calibration alone cannot
+reach 1 yd — the footpoint (bottom-centre of the box) and the single-camera geometry are the
+next limits. On the best-calibrated clip that residual is 0.74 yd, so ~1 yd is reachable where
+registration is good.
+
 ## Evaluation now follows the standard MOT paradigm (2026-10-02)
 
 The earlier tuning loop was circular because **the metric was the moving part**. The in-house
