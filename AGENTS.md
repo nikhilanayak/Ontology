@@ -72,7 +72,7 @@ Restart the remote viewer after a successful deployment:
 
 ```bash
 ssh -p 2222 nikhil@50.39.98.5 \
-  "cd /home/nikhil/fast/Ontology && source scripts/production-env.sh && pkill -f '[a]ll22 serve' || true; cd /home/nikhil/fast/Ontology && source scripts/production-env.sh && nohup .venv/bin/all22 serve --host 127.0.0.1 --port 8000 >.runtime/all22-serve.log 2>&1 &"
+  "cd /home/nikhil/fast/Ontology && source scripts/production-env.sh && pkill -f '[a]ll22 serve' || true; cd /home/nikhil/fast/Ontology && source scripts/production-env.sh && (setsid nohup .venv/bin/all22 serve --host 127.0.0.1 --port 8000 >.runtime/all22-serve.log 2>&1 </dev/null &); sleep 5"
 ssh -p 2222 nikhil@50.39.98.5 \
   "curl --fail --silent --show-error http://127.0.0.1:8000/api/games >/dev/null"
 ```

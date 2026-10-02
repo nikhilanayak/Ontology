@@ -8,11 +8,11 @@ Do not run the full season yet. The immediate objective is to improve and valida
 
 ## Current state
 
-- Code/evaluation baseline `ae4a847` (`Separate spatial observations from durable identities`) is deployed on production.
+- Deployed commit: **`14ffe8f`** (`Freeze a reproducible BDB evaluation protocol`) on production, GitHub `origin/main`, and local. Remote suite: **65 passed** (`.venv/bin/python -m pytest -q`, 2026-10-02). Viewer restarted and `GET /api/games` verified.
 - Handoff documents were added and pushed in `dc0d9a1` (`Document agent workflow and project handoff`). Future agents must run `git rev-parse HEAD` and compare local, GitHub, and production before changing or deploying code.
-- Full test suite: **65 tests passing** (local, Python 3.13 venv created at `/Users/nnayak/Ontology/.venv`).
+- Local tooling: Python 3.13 venv at `/Users/nnayak/Ontology/.venv` (ignored); `gh` installed via Homebrew and authenticated as `nikhilanayak`; `origin` is HTTPS with `gh auth setup-git` credentials. `npm`/`node` are not installed locally, so `npm run cv:test` must be replaced by `.venv/bin/python -m pytest -q` here.
 - Implemented: semantic field calibration, keyframed field tracking, crowd gating, role-aware tracking, camera-angle scale gating, tracklet relinking, identity evaluation, 64-dimensional ResNet18 appearance embeddings, separation of spatial observations from durable identity evaluation, and a **frozen evaluation protocol** (see below).
-- Frozen evaluation protocol (local, not yet deployed at time of writing; see "Deployment log"):
+- Frozen evaluation protocol (deployed):
   - `all22 freeze-evaluation-protocol --game-id ... [--clip-id ...]` writes `data/evaluation-protocols/<game>.json` pinning: audited clip list, BDB play id, selected action window (`snap_s`/`dead_s`), BDB snap frame and truth row count, detections artifact sha256/model/config hash, calibration revision, tracks file sha256 and tracker `config_hash` at freeze, `EVALUATOR_VERSION` (`bdb-audited-v2`), `EVALUATOR_PARAMETERS`, git commit and dirty flag.
   - `all22 evaluate-audited-sources --protocol <path>` scores exactly that set over the frozen windows and fails closed on: missing tracks, unscorable source, BDB answer-key change, evaluator version/parameter mismatch, and detections/calibration drift (overridable only with `--allow-input-drift --drift-note`, which marks the output `drift_allowed: true`).
   - Every evaluation JSON now includes `provenance` (evaluator version/parameters, git commit, dirty flag, tracks dir, protocol sha256) and per-source `tracks.sha256`, `tracks.config_hash`, `inputs.detections`, `inputs.calibration_revision`, and the evaluated `window`.
@@ -48,8 +48,29 @@ These files are private, ignored evaluation artifacts under `data/`; record thei
 | Pre-embedding identity baseline | `data/bdb-audited-evaluation-identities.json` | median purity `0.46335`; switches/100 `30.247` |
 | 64d embedding, same evaluator | `data/bdb-audited-evaluation-embed64.json` | purity `0.4948`; switches/100 `28.8862`; refined error `2.66625 yd`; coverage `0.6638` |
 | Latest separated evaluator, 18 sources | `data/bdb-audited-evaluation-embed64-separated.json` | raw error `5.2657 yd`; coverage `0.76317`; refined error `2.92556 yd`; purity `0.48576`; switches/100 `29.8966` |
+| **Protocol baseline** (`14ffe8f`, protocol `cf167f0e…b9e2ae`, 18 sources) | `data/evaluations/bills-at-rams-2022-reg-1/baseline-14ffe8f.json` | raw error `5.26572 yd`; coverage `0.76317`; refined error `2.92556 yd`; purity `0.48576`; switches/100 `29.8966`; `drift_allowed: false`; `input_drift: []` |
 
 The latest separated-evaluator result is **not spatially comparable** to the two earlier runs because the evaluator and observation/identity separation changed. Do not characterize its raw/refined spatial movement as a regression or improvement without an apples-to-apples rerun.
+
+The protocol baseline reproduces the separated-evaluator row exactly, confirming the protocol refactor is numerically neutral. **All future comparable rows must be produced with `--protocol` against the same protocol sha256 and the same `evaluator_version` (`bdb-audited-v2`).**
+
+### Active protocol
+
+- Path (production): `data/evaluation-protocols/bills-at-rams-2022-reg-1.json`
+- `sha256`: `cf167f0e06f9ddad254ec56fe667adf45c62cc74d319f372bc8e1f41b0b9e2ae`
+- Frozen at commit `14ffe8f`, `git_dirty: false`, evaluator `bdb-audited-v2`
+- Command: `.venv/bin/all22 freeze-evaluation-protocol --game-id bills-at-rams-2022-reg-1` (no detector run; existing tracks under `data/clip-tracks`)
+- Sources (18): clips `0003 0004 0005 0006 0007 0008 0009 0010 0013 0014 0121 0122 0277 0278 0293 0294 0295 0296`
+- Skipped (2, recorded in the protocol): `0011`, `0012` — BDB play `146` has no play signature (no snap event in the imported tracking).
+- Known gap: `tracks.config_hash` is `null` for all 18 sources because their `clip_tracks` artifacts predate `14ffe8f`. Re-running `reconstruct-clip` on a clip populates it; this does not trip protocol drift (tracks are the thing under test).
+
+Comparable evaluation command:
+
+```bash
+.venv/bin/all22 evaluate-audited-sources \
+  --protocol data/evaluation-protocols/bills-at-rams-2022-reg-1.json \
+  --output data/evaluations/bills-at-rams-2022-reg-1/<label>.json
+```
 
 Selected latest per-source results:
 
@@ -61,10 +82,9 @@ Selected latest per-source results:
 
 ## Immediate next work
 
-1. Deploy the protocol commit, then on production: `freeze-evaluation-protocol --game-id bills-at-rams-2022-reg-1` against the existing 18 audited tracks (no detector run needed), and record the protocol sha256 here. Run the first `--protocol` evaluation to establish the comparable baseline row.
-2. Tune embedding association on a small explicit clip set (`0005`, `0278`, `0295`) without losing good spatial tracks. Re-run `reconstruct-clip` for those clips only, then score with `--protocol`. Treat identity purity/switches and spatial error/coverage as separate paired outcomes; each tracker variant has a distinct `config_hash`.
-3. Improve field-boundary estimation and homography robustness, especially on the three weak example sources above. Note that re-calibrating a clip changes its calibration revision and will (correctly) trip protocol drift; re-freeze deliberately when that is the intent.
-4. Validate changes on additional bounded clips only after the explicit pilot clips improve or reveal a stable tradeoff.
-5. Keep all detection/reconstruction work bounded (`--clip-id` preferred, otherwise a small `--limit`). Do **not** start a full-game or full-season run.
+1. Tune embedding association on a small explicit clip set (`0005`, `0278`, `0295`) without losing good spatial tracks. Re-run `reconstruct-clip` for those clips only, then score with `--protocol`. Treat identity purity/switches and spatial error/coverage as separate paired outcomes; each tracker variant has a distinct `config_hash`.
+2. Improve field-boundary estimation and homography robustness, especially on the three weak example sources above. Note that re-calibrating a clip changes its calibration revision and will (correctly) trip protocol drift; re-freeze deliberately when that is the intent.
+3. Validate changes on additional bounded clips only after the explicit pilot clips improve or reveal a stable tradeoff.
+4. Keep all detection/reconstruction work bounded (`--clip-id` preferred, otherwise a small `--limit`). Do **not** start a full-game or full-season run.
 
 Canonical test, deployment, bounded experiment, and server-restart commands are maintained in `AGENTS.md`. Update this file immediately after the next experiment or deployment with the exact commit, command, source set, artifact path, and metrics.
