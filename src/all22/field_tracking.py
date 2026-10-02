@@ -336,17 +336,31 @@ class FieldSpaceTracker:
     shape_gate = 1.0
     shape_weight = .6
     confidence_weight = .5
+    # Lifecycle defaults live on the class so a sweep can override them in one
+    # place; passing None to the constructor keeps the class value.
+    maximum_missed = 15
+    maximum_speed_yps = 15.0
+    high_confidence = .55
+    low_confidence = .15
+    crowd_multiplier = 1.6
+    crowd_floor = 32
 
-    def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
-                 high_confidence: float = .55, low_confidence: float = .15,
-                 crowd_multiplier: float = 1.6, crowd_floor: int = 32,
+    def __init__(self, maximum_missed: Optional[int] = None, maximum_speed_yps: Optional[float] = None,
+                 high_confidence: Optional[float] = None, low_confidence: Optional[float] = None,
+                 crowd_multiplier: Optional[float] = None, crowd_floor: Optional[int] = None,
                  use_box_shape: bool = True):
-        self.maximum_missed = maximum_missed
-        self.maximum_speed_yps = maximum_speed_yps
-        self.high_confidence = high_confidence
-        self.low_confidence = low_confidence
-        self.crowd_multiplier = crowd_multiplier
-        self.crowd_floor = crowd_floor
+        if maximum_missed is not None:
+            self.maximum_missed = maximum_missed
+        if maximum_speed_yps is not None:
+            self.maximum_speed_yps = maximum_speed_yps
+        if high_confidence is not None:
+            self.high_confidence = high_confidence
+        if low_confidence is not None:
+            self.low_confidence = low_confidence
+        if crowd_multiplier is not None:
+            self.crowd_multiplier = crowd_multiplier
+        if crowd_floor is not None:
+            self.crowd_floor = crowd_floor
         self.use_box_shape = use_box_shape
         self.nominal_detection_counts: list[int] = []
         self.active: list[FieldTrack] = []
