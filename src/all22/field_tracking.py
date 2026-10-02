@@ -169,6 +169,23 @@ def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[fl
         centers = updated
     fit_labels = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2).argmin(axis=1)
     counts = np.bincount(fit_labels, minlength=clusters)
+    if clusters == 3 and int(counts.min()) > max(2, int(.18 * len(fit_values))):
+        # A genuine official group should be distinctly smaller than either
+        # 11-player team. Three similarly sized clusters usually mean lighting
+        # or uniform accents split one team, so refit as two teams.
+        centers = centers[np.argsort(-counts)[:2]]
+        clusters = 2
+        for _ in range(20):
+            distances = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2)
+            labels = distances.argmin(axis=1)
+            updated = np.vstack([fit_values[labels == index].mean(axis=0)
+                                 if np.any(labels == index) else centers[index]
+                                 for index in range(clusters)])
+            if np.allclose(updated, centers):
+                break
+            centers = updated
+        fit_labels = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2).argmin(axis=1)
+        counts = np.bincount(fit_labels, minlength=clusters)
     player_clusters = set(np.argsort(-counts)[:2].tolist())
     values = normalized[finite]
     distances = np.linalg.norm(values[:, None, :] - centers[None, :, :], axis=2)
