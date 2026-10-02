@@ -16,6 +16,7 @@ from scipy.optimize import linear_sum_assignment
 
 from . import bdb
 from .action_alignment import ActionUnit, match_cost
+from .hota import HotaAccumulator, combine_sequences
 from .actions import signature_for_action
 from .db import connect
 from .geometry import normalize_direction
@@ -24,7 +25,7 @@ from .geometry import normalize_direction
 # Bump this whenever the BDB comparison logic (alignment search, refinement,
 # identity matching, or aggregation) changes.  Results produced by different
 # evaluator versions are not comparable and must not be reported side by side.
-EVALUATOR_VERSION = "bdb-audited-v2"
+EVALUATOR_VERSION = "bdb-audited-v3-hota"
 PROTOCOL_VERSION = 1
 
 EVALUATOR_PARAMETERS: dict = {
@@ -40,6 +41,10 @@ EVALUATOR_PARAMETERS: dict = {
     "refinement_ransac_threshold_yards": 2.0,
     "refinement_minimum_pairs": 30,
     "identity_maximum_error_yards": 8.0,
+    # HOTA localization scale: a pair exactly this far apart scores .05 and so
+    # cannot match at any standard alpha. Chosen from player spacing rather than
+    # tuned, and frozen into the protocol.
+    "hota_tau_yards": 2.5,
 }
 
 
@@ -428,6 +433,43 @@ def _load_truth(connection, external_id: str, play_id: str) -> tuple[pd.DataFram
     return truth, int(snap_rows.frame_id.min())
 
 
+def hota_for_source(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+                    bdb_snap_frame: int, offset_s: float, flip_x: bool, flip_y: bool,
+                    shift_x: float, correction_matrix: list, tau: float) -> dict:
+    """Score one source with HOTA after the same alignment the spatial metrics use.
+
+    HOTA replaces the earlier purity/switch score because it integrates over the
+    localization threshold instead of committing to one distance gate, and it
+    separates detection failures (DetA) from identity failures (AssA).
+    """
+    if tracks.empty or "track_id" not in tracks or "nfl_id" not in truth:
+        accumulator = HotaAccumulator(tau=tau)
+        return accumulator.compute()
+    value = tracks.copy()
+    predicted = value[["field_x", "field_y"]].to_numpy(float)
+    if flip_x:
+        predicted[:, 0] = 120.0 - predicted[:, 0]
+    if flip_y:
+        predicted[:, 1] = 160.0 / 3.0 - predicted[:, 1]
+    predicted[:, 0] += shift_x
+    correction = np.asarray(correction_matrix, dtype=float)
+    predicted = cv2.perspectiveTransform(
+        predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
+    value[["aligned_x", "aligned_y"]] = predicted
+    answers = {int(frame_id): group for frame_id, group in truth.groupby("frame_id")}
+    accumulator = HotaAccumulator(tau=tau)
+    for timestamp, group in value.groupby("video_timestamp", sort=True):
+        frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
+        actual = answers.get(frame_id)
+        if actual is None or actual.empty:
+            continue
+        accumulator.add_frame(actual.nfl_id.astype(str).tolist(),
+                              actual[["x", "y"]].to_numpy(float),
+                              group.track_id.astype(str).tolist(),
+                              group[["aligned_x", "aligned_y"]].to_numpy(float))
+    return accumulator.compute()
+
+
 def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: int,
                      snap_s: float, dead_s: float,
                      parameters: Optional[dict] = None) -> tuple[Optional[dict], Optional[str]]:
@@ -486,6 +528,9 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     identities = identity_metrics(
         identity_window, truth, snap_s, bdb_snap, offset, flip_x, flip_y, shift_x,
         bdb_refinement["correction_matrix"], maximum_error=parameters["identity_maximum_error_yards"])
+    hota = hota_for_source(
+        identity_window, truth, snap_s, bdb_snap, offset, flip_x, flip_y, shift_x,
+        bdb_refinement["correction_matrix"], parameters["hota_tau_yards"])
     return {
         "window": {"snap_s": snap_s, "dead_s": dead_s},
         "spatial_track_rows": int(len(window)), "identity_track_rows": int(len(identity_window)),
@@ -495,6 +540,9 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
         "player_coverage": matched / max(possible, 1),
         "median_error_yards": median, "p90_error_yards": float(np.percentile(errors, 90)),
         "bdb_refinement": bdb_refinement,
+        "hota": hota,
+        # Retained as diagnostics only. These depend on a single hard distance
+        # gate, which made them unusable for comparing tracker changes.
         "identity_metrics": identities,
     }, None
 
@@ -511,16 +559,24 @@ def _tracks_provenance(connection, clip_id: str, path: Path) -> dict:
             "artifact_matched": artifact is not None}
 
 
-def _summarize(game_id: str, results: list[dict], skipped: list[dict], provenance: dict) -> dict:
+def _summarize(game_id: str, results: list[dict], skipped: list[dict], provenance: dict,
+               split: Optional[str] = None) -> dict:
     if not results:
         raise ValueError("No audited reconstructed sources overlap BDB plays: "
                          + json.dumps(skipped))
-    return {
-        "game_id": game_id, "sources": len(results),
+    hota = combine_sequences([row["hota"] for row in results if "hota" in row])
+    summary = {
+        "game_id": game_id, "sources": len(results), "split": split,
+        # HOTA is the headline: it integrates over the localization threshold and
+        # splits detection quality (DetA) from identity quality (AssA).
+        "hota": hota["HOTA"], "det_a": hota["DetA"], "ass_a": hota["AssA"],
+        "det_re": hota["DetRe"], "det_pr": hota["DetPr"],
+        "ass_re": hota["AssRe"], "ass_pr": hota["AssPr"], "loc_a": hota["LocA"],
         "median_source_error_yards": float(np.median([row["median_error_yards"] for row in results])),
         "median_source_coverage": float(np.median([row["player_coverage"] for row in results])),
         "median_refined_held_out_error_yards": float(np.median([
             row["bdb_refinement"]["held_out_median_error_yards"] for row in results])),
+        # Gate-dependent diagnostics; not comparable across tracker changes.
         "median_track_purity": float(np.median([
             row["identity_metrics"]["track_purity"] for row in results])),
         "median_switches_per_100_assignments": float(np.median([
@@ -529,6 +585,7 @@ def _summarize(game_id: str, results: list[dict], skipped: list[dict], provenanc
         "provenance": provenance,
         "results": results,
     }
+    return summary
 
 
 def _base_provenance(tracks_dir: Path) -> dict:
@@ -583,6 +640,7 @@ def freeze_evaluation_protocol(db_path: Path, game_id: str, tracks_dir: Path, ou
                 continue
             sources.append({
                 "clip_id": clip_id, "bdb_play_id": play_id, "angle": selected["angle"],
+                "split": _split_for(clip_id),
                 "action_id": selected["action_id"], "candidate_actions": len(candidates),
                 "selection_cost": float(selection_cost),
                 "snap_s": float(selected["snap_s"]), "dead_s": float(selected["dead_s"]),
@@ -605,6 +663,19 @@ def freeze_evaluation_protocol(db_path: Path, game_id: str, tracks_dir: Path, ou
     return protocol
 
 
+def _split_for(clip_id: str, validation_fraction: float = .5) -> str:
+    """Deterministically assign a source to validation or test.
+
+    Hyperparameters must be chosen on validation and reported once on test.
+    Tuning and reporting on the same sources, as the earlier sweeps did, turns
+    noise into apparent gains: one sweep scored .459 and .503 for configurations
+    whose difference was within the spread of the same 18 clips.
+    The hash keeps the assignment stable across runs and machines.
+    """
+    digest = hashlib.sha256(clip_id.encode("utf-8")).hexdigest()
+    return "validation" if int(digest[:8], 16) / 0xFFFFFFFF < validation_fraction else "test"
+
+
 def _protocol_drift(frozen: dict, current: dict) -> list[str]:
     reasons = []
     for key in ("sha256", "model_version", "config_hash"):
@@ -619,7 +690,8 @@ def _protocol_drift(frozen: dict, current: dict) -> list[str]:
 
 
 def evaluate_with_protocol(db_path: Path, protocol_path: Path, tracks_dir: Path,
-                           allow_drift: bool = False, drift_note: Optional[str] = None) -> dict:
+                           allow_drift: bool = False, drift_note: Optional[str] = None,
+                           split: Optional[str] = None) -> dict:
     """Evaluate the frozen source set with frozen windows; fail closed on input drift.
 
     ``allow_drift`` only covers detections/calibration inputs.  A changed BDB
@@ -634,10 +706,14 @@ def evaluate_with_protocol(db_path: Path, protocol_path: Path, tracks_dir: Path,
     if protocol.get("evaluator_parameters") != EVALUATOR_PARAMETERS:
         raise ValueError("Protocol evaluator parameters differ from this code; re-freeze the protocol")
     game_id, external_id = protocol["game_id"], protocol["bdb_game_id"]
+    if split not in (None, "validation", "test", "all"):
+        raise ValueError("split must be validation, test, or all")
     results, failures, drift = [], [], []
     with connect(db_path) as connection:
         for source in protocol["sources"]:
             clip_id = source["clip_id"]
+            if split in ("validation", "test") and source.get("split", "test") != split:
+                continue
             path = tracks_dir / f"{clip_id}.parquet"
             if not path.exists():
                 failures.append({"clip_id": clip_id, "reason": "tracks parquet missing", "path": str(path)})
@@ -676,7 +752,7 @@ def evaluate_with_protocol(db_path: Path, protocol_path: Path, tracks_dir: Path,
                                "git_commit_at_freeze": protocol.get("git_commit"),
                                "git_dirty_at_freeze": protocol.get("git_dirty")},
                   "input_drift": drift, "drift_allowed": bool(allow_drift), "drift_note": drift_note}
-    return _summarize(game_id, results, [], provenance)
+    return _summarize(game_id, results, [], provenance, split or "all")
 
 
 def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> dict:
@@ -717,4 +793,4 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                 **scored,
             })
     provenance = {**_base_provenance(tracks_dir), "protocol": None}
-    return _summarize(game_id, results, skipped, provenance)
+    return _summarize(game_id, results, skipped, provenance, "all")

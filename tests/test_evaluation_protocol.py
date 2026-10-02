@@ -274,3 +274,53 @@ def test_provenance_records_git_state(tmp_path: Path):
     provenance = result["provenance"]
     assert set(provenance) >= {"git_commit", "git_dirty", "evaluated_at", "tracks_dir"}
     assert provenance["git_dirty"] in (True, False, None)
+
+
+def test_protocol_assigns_stable_validation_and_test_splits(tmp_path: Path):
+    """Hyperparameters are chosen on validation; test is reported once."""
+    database, tracks_dir, _ = prepared_case(tmp_path)
+    add_second_source(database)
+    _write_tracks(tracks_dir, "d", offset_s=-40.0)
+    with transaction(database) as connection:
+        connection.execute("UPDATE action_windows SET snap_s=50.0, dead_s=54.0 WHERE clip_id='d'")
+    protocol_path = tmp_path / "protocol.json"
+    protocol = supervision.freeze_evaluation_protocol(database, "g", tracks_dir, protocol_path)
+    splits = {item["clip_id"]: item["split"] for item in protocol["sources"]}
+    assert set(splits.values()) <= {"validation", "test"}
+    # The assignment is a pure function of the clip id, so it is reproducible.
+    again = supervision.freeze_evaluation_protocol(database, "g", tracks_dir, tmp_path / "p2.json")
+    assert {item["clip_id"]: item["split"] for item in again["sources"]} == splits
+    assert supervision._split_for("c") == supervision._split_for("c")
+
+
+def test_evaluation_reports_hota_and_separates_detection_from_association(tmp_path: Path):
+    database, tracks_dir, _ = prepared_case(tmp_path)
+    result = supervision.evaluate_audited_sources(database, "g", tracks_dir)
+    # Tracks were generated from the truth, so detection and association are perfect.
+    assert result["hota"] == pytest.approx(1.0, abs=1e-6)
+    assert result["det_a"] == pytest.approx(1.0, abs=1e-6)
+    assert result["ass_a"] == pytest.approx(1.0, abs=1e-6)
+    assert result["loc_a"] > .99
+    assert result["hota"] == pytest.approx((result["det_a"] * result["ass_a"]) ** .5, abs=1e-6)
+    source = result["results"][0]
+    assert source["hota"]["gt_ids"] == PLAYERS
+    assert source["hota"]["tau"] == supervision.EVALUATOR_PARAMETERS["hota_tau_yards"]
+    json.dumps(result)
+
+
+def test_hota_detects_an_identity_swap_that_purity_understates(tmp_path: Path):
+    """An induced swap must lower AssA while leaving DetA untouched."""
+    database, tracks_dir, _ = prepared_case(tmp_path)
+    frame = pd.read_parquet(tracks_dir / "c.parquet")
+    half = frame.video_timestamp.median()
+    swapped = frame.copy()
+    first, second = "c:t1", "c:t2"
+    late = swapped.video_timestamp > half
+    swapped.loc[late & (frame.track_id == first), "track_id"] = "tmp"
+    swapped.loc[late & (frame.track_id == second), "track_id"] = first
+    swapped.loc[swapped.track_id == "tmp", "track_id"] = second
+    swapped.to_parquet(tracks_dir / "c.parquet", index=False)
+    result = supervision.evaluate_audited_sources(database, "g", tracks_dir)
+    assert result["det_a"] == pytest.approx(1.0, abs=1e-6), "no detection was lost"
+    assert result["ass_a"] < 1.0, "but identity was broken"
+    assert result["hota"] < result["det_a"]

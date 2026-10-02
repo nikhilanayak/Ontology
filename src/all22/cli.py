@@ -195,6 +195,9 @@ def parser() -> argparse.ArgumentParser:
     evaluate_sources.add_argument("--tracks-dir", type=Path, default=ROOT / "data" / "clip-tracks")
     evaluate_sources.add_argument("--allow-input-drift", action="store_true",
                                   help="With --protocol: score even if detections/calibration changed")
+    evaluate_sources.add_argument("--split", choices=("validation", "test", "all"),
+                                  default="validation",
+                                  help="Tune on validation; report on test once")
     evaluate_sources.add_argument("--drift-note",
                                   help="With --allow-input-drift: why the drift is acceptable (recorded)")
     evaluate_sources.add_argument("--output", type=Path,
@@ -404,7 +407,8 @@ def main() -> None:
             if args.allow_input_drift and not args.drift_note:
                 raise SystemExit("--allow-input-drift requires --drift-note explaining the accepted drift")
             value = supervision.evaluate_with_protocol(
-                args.db, args.protocol, args.tracks_dir, args.allow_input_drift, args.drift_note)
+                args.db, args.protocol, args.tracks_dir, args.allow_input_drift, args.drift_note,
+                args.split)
         else:
             if args.allow_input_drift:
                 raise SystemExit("--allow-input-drift only applies with --protocol")
