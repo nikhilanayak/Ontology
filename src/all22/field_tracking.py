@@ -131,6 +131,43 @@ def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) ->
             "on_field_fraction": float(result.on_field.mean())}
 
 
+OFFICIAL_CLUSTER_FRACTION = .30
+OFFICIAL_CLUSTER_FLOOR = 4
+TEAM_CONFIDENCE_MINIMUM = .15
+SNAP_SEPARATION_MINIMUM_PLAYERS = 12
+SNAP_SEPARATION_MINIMUM_GAP_YARDS = .75
+
+
+def snap_team_split(snap_rows: pd.DataFrame) -> Optional[dict]:
+    """Split the snap formation across the line of scrimmage.
+
+    At the snap the two teams occupy disjoint ranges of ``field_x``: in BDB truth
+    a single x threshold separates them perfectly. That is a far stronger signal
+    than jersey colour under stadium lighting, so it is used to supervise the
+    colour clustering rather than the other way round.
+    """
+    if snap_rows.empty or "field_x" not in snap_rows:
+        return None
+    values = pd.to_numeric(snap_rows.field_x, errors="coerce").to_numpy(float)
+    values = values[np.isfinite(values)]
+    if len(values) < SNAP_SEPARATION_MINIMUM_PLAYERS:
+        return None
+    ordered = np.sort(values)
+    gaps = np.diff(ordered)
+    # Only consider splits that leave a plausible unit on each side.
+    margin = max(4, int(.25 * len(ordered)))
+    interior = slice(margin - 1, len(gaps) - margin + 1)
+    if interior.start >= interior.stop:
+        return None
+    offset = int(np.argmax(gaps[interior])) + interior.start
+    gap = float(gaps[offset])
+    if gap < SNAP_SEPARATION_MINIMUM_GAP_YARDS:
+        return None
+    threshold = float((ordered[offset] + ordered[offset + 1]) / 2)
+    return {"threshold": threshold, "gap_yards": gap,
+            "left": int((values < threshold).sum()), "right": int((values > threshold).sum())}
+
+
 def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[float] = None) -> pd.DataFrame:
     result = frame.copy()
     scale_by_column = {"lab_l": 50, "lab_a": 30, "lab_b": 30, "hsv_s": 60}
@@ -170,7 +207,8 @@ def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[fl
         centers = updated
     fit_labels = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2).argmin(axis=1)
     counts = np.bincount(fit_labels, minlength=clusters)
-    if clusters == 3 and int(counts.min()) > max(2, int(.18 * len(fit_values))):
+    if clusters == 3 and int(counts.min()) > max(OFFICIAL_CLUSTER_FLOOR,
+                                                 int(OFFICIAL_CLUSTER_FRACTION * len(fit_values))):
         # A genuine official group should be distinctly smaller than either
         # 11-player team. Three similarly sized clusters usually mean lighting
         # or uniform accents split one team, so refit as two teams.
@@ -194,7 +232,7 @@ def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[fl
     ordered = np.sort(distances, axis=1)
     confidence = 1 - ordered[:, 0] / np.maximum(ordered[:, 1], 1e-6)
     indices = np.flatnonzero(finite)
-    confident = confidence >= .15
+    confident = confidence >= TEAM_CONFIDENCE_MINIMUM
     team_names = {cluster: f"team_{order}" for order, cluster in enumerate(sorted(player_clusters))}
     names = [team_names.get(int(value), "official") for value in labels[confident]]
     result.loc[result.index[indices[confident]], "team"] = names
@@ -202,6 +240,61 @@ def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[fl
         "player" if name.startswith("team_") else "official" for name in names]
     result.loc[result.index[indices], "team_confidence"] = confidence
     return result
+
+
+def resolve_track_teams(frame: pd.DataFrame, snap_timestamp: Optional[float]) -> tuple[pd.DataFrame, dict]:
+    """Assign one team per track, preferring snap geometry over per-detection colour.
+
+    A track is one player and therefore one team, so the label is decided once
+    per track instead of per detection. When the snap formation separates
+    cleanly across the line of scrimmage, that split supervises the naming; the
+    colour clusters only carry it to tracks that are absent at the snap.
+    """
+    result = frame.copy()
+    diagnostics: dict = {"method": "colour_vote"}
+    if result.empty or "track_id" not in result:
+        return result, diagnostics
+    roles = (result.assign(_role=result.person_role)
+             .groupby("track_id")._role.agg(lambda values: values.mode().iloc[0]))
+    official_tracks = set(roles[roles == "official"].index)
+    players = result[~result.track_id.isin(official_tracks)]
+    votes = (players[players.team.str.startswith("team_")]
+             .groupby(["track_id", "team"]).size().unstack(fill_value=0))
+    colour_team = votes.idxmax(axis=1) if len(votes) else pd.Series(dtype=str)
+    assignment = dict(colour_team)
+    if snap_timestamp is not None and len(players):
+        distance = (players.video_timestamp - float(snap_timestamp)).abs()
+        snap_rows = players[distance <= float(distance.min()) + .02]
+        snap_rows = snap_rows.groupby("track_id")[["field_x"]].median().reset_index()
+        split = snap_team_split(snap_rows)
+        if split:
+            left = set(snap_rows.loc[snap_rows.field_x < split["threshold"], "track_id"])
+            right = set(snap_rows.loc[snap_rows.field_x > split["threshold"], "track_id"])
+            # Name the sides so they agree with the dominant colour vote, keeping
+            # team_0/team_1 consistent with the appearance clusters.
+            def side_name(side: set, fallback: str) -> str:
+                names = [assignment[track] for track in side if track in assignment]
+                return pd.Series(names).mode().iloc[0] if names else fallback
+            left_name = side_name(left, "team_0")
+            right_name = side_name(right, "team_1")
+            if left_name == right_name:
+                right_name = "team_1" if left_name == "team_0" else "team_0"
+            for track in left:
+                assignment[track] = left_name
+            for track in right:
+                assignment[track] = right_name
+            diagnostics = {"method": "snap_line_of_scrimmage", "threshold_x": split["threshold"],
+                           "gap_yards": split["gap_yards"], "left": split["left"], "right": split["right"],
+                           "snap_tracks": int(len(snap_rows))}
+    for track in official_tracks:
+        assignment[track] = "official"
+    resolved = result.track_id.map(assignment).fillna("unknown")
+    result["team"] = resolved
+    result["person_role"] = np.where(resolved == "official", "official",
+                                     np.where(resolved.str.startswith("team_"), "player", "unknown"))
+    counts = result.groupby("team").track_id.nunique().to_dict()
+    diagnostics["tracks_by_team"] = {str(key): int(value) for key, value in counts.items()}
+    return result, diagnostics
 
 
 @dataclass
@@ -414,7 +507,14 @@ RELIABLE_COVERAGE_MINIMUM = .35
 
 def tracking_config(tracker: "FieldSpaceTracker", relink: Optional[dict] = None) -> dict:
     return {"tracker": tracker.config(), "relink": dict(relink or RELINK_PARAMETERS),
-            "reliable_coverage_minimum": RELIABLE_COVERAGE_MINIMUM}
+            "reliable_coverage_minimum": RELIABLE_COVERAGE_MINIMUM,
+            "reliability_window": "play_span",
+            "team": {"official_cluster_fraction": OFFICIAL_CLUSTER_FRACTION,
+                     "official_cluster_floor": OFFICIAL_CLUSTER_FLOOR,
+                     "confidence_minimum": TEAM_CONFIDENCE_MINIMUM,
+                     "snap_minimum_players": SNAP_SEPARATION_MINIMUM_PLAYERS,
+                     "snap_minimum_gap_yards": SNAP_SEPARATION_MINIMUM_GAP_YARDS,
+                     "resolution": "per_track_snap_los"}}
 
 
 def config_hash(config: dict) -> str:
@@ -493,19 +593,8 @@ def relink_tracklets(frame: pd.DataFrame, maximum_gap_s: Optional[float] = None,
     return result, len(links)
 
 
-def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: Path) -> dict:
-    with connect(db_path) as connection:
-        action = connection.execute(
-            "SELECT snap_s FROM action_windows WHERE clip_id=? AND snap_s IS NOT NULL "
-            "ORDER BY (status='verified') DESC, confidence DESC LIMIT 1", (clip_id,),
-        ).fetchone()
-        clip = connection.execute("SELECT angle FROM clips WHERE clip_id=?", (clip_id,)).fetchone()
-    frame = assign_team_probabilities(
-        pd.read_parquet(projected), float(action["snap_s"]) if action else None)
-    frame = frame[frame.on_field & frame.calibration_valid].copy()
-    if frame.empty:
-        raise ValueError("No valid on-field detections are available for tracking")
-    tracker = FieldSpaceTracker(use_box_shape=not clip or clip["angle"] != "endzone")
+def _run_tracker(frame: pd.DataFrame, clip_id: str, angle: Optional[str]) -> tuple[pd.DataFrame, "FieldSpaceTracker"]:
+    tracker = FieldSpaceTracker(use_box_shape=angle != "endzone")
     parts = []
     for timestamp, group in frame.groupby("video_timestamp", sort=True):
         value = group.copy()
@@ -527,21 +616,72 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         value["observed"] = True
         value["interpolated"] = False
         parts.append(value)
+    if not parts:
+        raise ValueError("Tracking produced no trajectories")
+    return pd.concat(parts, ignore_index=True), tracker
+
+
+def estimate_play_window(tracks: pd.DataFrame, clip_start: float, clip_end: float) -> Optional[tuple[float, float]]:
+    """Derive the live-action span from motion alone, without reading action_windows.
+
+    Tracking must not depend on `action_windows`, because those rows are written
+    by action discovery *after* tracking. Reading them made the first run of a
+    clip behave differently from every later run.
+    """
+    from .actions import discover_action_candidates
+    candidates = discover_action_candidates(tracks, clip_start, clip_end)
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda item: (item.dead_s - item.snap_s) * item.confidence)
+    return float(best.snap_s), float(best.dead_s)
+
+
+def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: Path) -> dict:
+    with connect(db_path) as connection:
+        clip = connection.execute(
+            "SELECT angle,start_s,end_s FROM clips WHERE clip_id=?", (clip_id,)).fetchone()
+    angle = clip["angle"] if clip else None
+    projection = pd.read_parquet(projected)
+    valid = projection[projection.on_field & projection.calibration_valid].copy()
+    if valid.empty:
+        raise ValueError("No valid on-field detections are available for tracking")
+    clip_start = float(clip["start_s"]) if clip else float(valid.video_timestamp.min())
+    clip_end = float(clip["end_s"]) if clip else float(valid.video_timestamp.max())
+    # Pass 1: unanchored tracking purely to locate the live-action span.
+    scout_frame = assign_team_probabilities(valid, None)
+    scout, _ = _run_tracker(scout_frame, clip_id, angle)
+    scout_frames = max(1, int(scout.video_timestamp.nunique()))
+    scout = scout.assign(
+        track_coverage=scout.track_id.map(scout.groupby("track_id").size() / scout_frames))
+    scout["track_reliable"] = scout.track_coverage >= RELIABLE_COVERAGE_MINIMUM
+    window = estimate_play_window(scout, clip_start, clip_end)
+    snap_s = window[0] if window else None
+    # Pass 2: the real run, anchored on the motion-derived snap.
+    frame = assign_team_probabilities(valid, snap_s)
+    result, tracker = _run_tracker(frame, clip_id, angle)
     relink_gates = dict(RELINK_PARAMETERS)
-    result, tracklet_links = relink_tracklets(pd.concat(parts, ignore_index=True), gates=relink_gates)
-    total_frames = max(1, int(result.video_timestamp.nunique()))
-    observations = result.groupby("track_id").size()
-    coverage = (observations / total_frames).clip(upper=1)
-    result["track_observations"] = result.track_id.map(observations).astype(int)
-    result["track_coverage"] = result.track_id.map(coverage).astype(float)
+    result, tracklet_links = relink_tracklets(result, gates=relink_gates)
+    result, team_diagnostics = resolve_track_teams(result, snap_s)
+    # Durability is judged over the live-action span, not the whole shot: the
+    # pre-snap pan and post-whistle tail are roughly half of a typical clip and
+    # were pushing genuine play-long trajectories below the threshold.
+    if window:
+        span = result[(result.video_timestamp >= window[0]) & (result.video_timestamp <= window[1])]
+    else:
+        span = result
+    span_frames = max(1, int(span.video_timestamp.nunique()))
+    observations = span.groupby("track_id").size()
+    coverage = (observations / span_frames).clip(upper=1)
+    result["track_observations"] = result.track_id.map(observations).fillna(0).astype(int)
+    result["track_coverage"] = result.track_id.map(coverage).fillna(0.0).astype(float)
     # Keep short tracklets in the artifact for diagnosis, but mark the durable
     # trajectories that should drive action discovery and the tactical map.
     result["track_reliable"] = result.track_coverage >= RELIABLE_COVERAGE_MINIMUM
     reliable = result[result.track_reliable]
     burst_times = result.loc[result.crowd_burst, "video_timestamp"]
     roster_pool = reliable
-    if action and len(reliable):
-        distance = (reliable.video_timestamp - float(action["snap_s"])).abs()
+    if snap_s is not None and len(reliable):
+        distance = (reliable.video_timestamp - float(snap_s)).abs()
         snap_rows = reliable[distance <= float(distance.min()) + .02]
         snap_ids = set(snap_rows.track_id)
         if len(snap_ids) >= 12:
@@ -556,7 +696,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         mean_confidence=("confidence", "mean") if "confidence" in reliable else ("track_id", "size"),
         median_speed=("speed", "median"),
     )
-    roster_scores["score"] = (roster_scores.observations / total_frames
+    roster_scores["score"] = (roster_scores.observations / span_frames
                               + .15 * roster_scores.mean_confidence
                               + .05 * np.minimum(roster_scores.median_speed / 3, 1))
     roster_ids = set(roster_scores.nlargest(22, "score").index)
@@ -570,6 +710,8 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
                "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
                "tracklet_links": tracklet_links,
                "team_labeled_fraction": float((result.team != "unknown").mean()),
+               "estimated_window": list(window) if window else None,
+               "team_assignment": team_diagnostics,
                "config_hash": digest}
     with transaction(db_path) as connection:
         game_id = connection.execute("SELECT game_id FROM clips WHERE clip_id=?", (clip_id,)).fetchone()["game_id"]

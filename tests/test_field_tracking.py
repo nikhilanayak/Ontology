@@ -9,6 +9,8 @@ from all22.field_tracking import (
     assign_team_probabilities,
     config_hash,
     project_clip,
+    resolve_track_teams,
+    snap_team_split,
     save_calibration_keyframes,
     track_projected_clip,
     tracking_config,
@@ -18,8 +20,8 @@ from all22.field_tracking import (
 
 def test_default_tracking_config_hash_is_pinned():
     """Changing any association weight or gate must be a deliberate, recorded decision."""
-    assert config_hash(tracking_config(FieldSpaceTracker())) == "287e337ef3ec9122"
-    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "c84e66fef7200bd4"
+    assert config_hash(tracking_config(FieldSpaceTracker())) == "86d90e97cad272ff"
+    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "72d5567fbeebc51e"
 
 
 def prepared_db(tmp_path: Path) -> tuple[Path, str]:
@@ -157,3 +159,67 @@ def test_relink_tracklets_joins_compatible_non_overlapping_fragments():
     assert count == 1
     assert linked[linked.video_timestamp < .2].track_id.iloc[0] == linked[linked.field_x == 12].track_id.iloc[0]
     assert linked.track_id.nunique() == 2
+
+
+def test_snap_team_split_separates_formation_across_line_of_scrimmage():
+    rows = [{"field_x": 48.0 + .1 * index} for index in range(11)]
+    rows += [{"field_x": 52.0 + .1 * index} for index in range(11)]
+    split = snap_team_split(pd.DataFrame(rows))
+    assert split is not None
+    assert 49.0 < split["threshold"] < 52.0
+    assert (split["left"], split["right"]) == (11, 11)
+    # A single clustered blob has no defensible line of scrimmage.
+    blob = pd.DataFrame([{"field_x": 50 + .05 * index} for index in range(22)])
+    assert snap_team_split(blob) is None
+    # Too few players at the snap is not enough evidence.
+    assert snap_team_split(pd.DataFrame([{"field_x": float(i)} for i in range(6)])) is None
+
+
+def test_resolve_track_teams_assigns_one_team_per_track_from_snap_geometry():
+    rows = []
+    for index in range(22):
+        side = 48.0 if index < 11 else 52.0
+        # Colour vote is deliberately wrong for one detection of each track.
+        for step, team in enumerate(("team_0", "team_1" if index % 7 == 0 else "team_0")):
+            rows.append({"track_id": f"t{index}", "video_timestamp": 10.0 + .1 * step,
+                         "field_x": side + .1 * index, "field_y": 20.0,
+                         "team": team, "person_role": "player"})
+    rows.append({"track_id": "ref", "video_timestamp": 10.0, "field_x": 30.0, "field_y": 5.0,
+                 "team": "official", "person_role": "official"})
+    resolved, diagnostics = resolve_track_teams(pd.DataFrame(rows), 10.0)
+    assert diagnostics["method"] == "snap_line_of_scrimmage"
+    per_track = resolved.groupby("track_id").team.nunique()
+    assert set(per_track) == {1}, "each track must carry exactly one team"
+    players = resolved[resolved.person_role == "player"]
+    assert players.groupby("team").track_id.nunique().to_dict() == {"team_0": 11, "team_1": 11}
+    assert resolved[resolved.track_id == "ref"].team.iloc[0] == "official"
+
+
+def test_tracking_does_not_read_action_windows(tmp_path: Path):
+    """Tracking must be deterministic: action windows are written after it runs."""
+    database, clip_id = prepared_db(tmp_path)
+    identity = {"image_points": [[0, 0], [120, 0], [0, 53.333], [120, 53.333]],
+                "field_points": [[0, 0], [120, 0], [0, 53.333], [120, 53.333]]}
+    save_calibration_keyframes(database, clip_id, {
+        "keyframes": [{"timestamp_s": 0.0, **identity}, {"timestamp_s": 3.0, **identity}]})
+    rows = []
+    for frame_id, timestamp in enumerate([round(.1 * i, 1) for i in range(31)]):
+        for player in range(4):
+            rows.append({"clip_id": clip_id, "frame_id": frame_id, "video_timestamp": timestamp,
+                         "contact_x": 20 + 4 * player + 2.0 * timestamp, "contact_y": 20 + player,
+                         "lab_a": 80 if player < 2 else 180, "lab_b": 80 if player < 2 else 180,
+                         "confidence": .9})
+    detections = tmp_path / "detections.parquet"
+    pd.DataFrame(rows).to_parquet(detections)
+    projected = tmp_path / "projected.parquet"
+    project_clip(database, clip_id, detections, projected)
+    first = track_projected_clip(database, clip_id, projected, tmp_path / "a.parquet")
+    with transaction(database) as connection:
+        connection.execute(
+            """INSERT INTO action_windows(action_id,clip_id,action_order,snap_s,dead_s,confidence)
+               VALUES('c:a01','c',1,1.0,2.0,.9)""")
+    second = track_projected_clip(database, clip_id, projected, tmp_path / "b.parquet")
+    assert first["config_hash"] == second["config_hash"]
+    assert first["tracks"] == second["tracks"]
+    assert first["estimated_window"] == second["estimated_window"]
+    assert pd.read_parquet(tmp_path / "a.parquet").equals(pd.read_parquet(tmp_path / "b.parquet"))
