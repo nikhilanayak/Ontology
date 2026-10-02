@@ -373,6 +373,10 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         value["track_id"] = [f"{clip_id}:t{item}" for item in ids]
         value["crowd_burst"] = tracker.last_crowd_burst
         active = {track.track_id: track for track in tracker.active}
+        value["team"] = [active[item].team for item in ids]
+        value["person_role"] = ["official" if active[item].team == "official" else
+                                ("player" if active[item].team.startswith("team_") else "unknown")
+                                for item in ids]
         value["vx"] = [float(active[item].velocity[0]) for item in ids]
         value["vy"] = [float(active[item].velocity[1]) for item in ids]
         value["speed"] = np.hypot(value.vx, value.vy)
