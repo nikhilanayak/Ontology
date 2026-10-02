@@ -6,7 +6,7 @@ from typing import Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -455,6 +455,6 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
 
         @app.get("/")
         def index():
-            return FileResponse(static_dir / "index.html")
+            return FileResponse(static_dir / "index.html", headers={"Cache-Control": "no-store"})
 
     return app

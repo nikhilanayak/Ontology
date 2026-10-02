@@ -1,6 +1,7 @@
 const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[], fieldDebug:null, detections:[], calibrationMatrices:[], frameDetections:new Map()};
 const layerOn = id => $(id)?.checked;
 const $ = id => document.getElementById(id);
+const setHidden = (id, hidden) => { const node=$(id); if(node) node.hidden=hidden; };
 async function json(url, options) { const r=await fetch(url,options); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
 function sizeVideoStage() {
@@ -197,7 +198,7 @@ async function selectShot(shot,button){
   document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button?.classList.add('active');state.shot=shot;state.play=null;state.activeSource=null;state.tracks=[];
   $('play-title').textContent=`${shot.angle} shot`;$('play-detail').textContent=`${shot.clip_id} · ${Number(shot.end_s-shot.start_s).toFixed(1)} seconds`;$('film').src=`/api/video/${state.game}`;
   $('audit').hidden=true;$('timing').hidden=true;$('calibration').hidden=false;$('calibration-status').textContent='';state.calibrationCurrent=null;
-  $('field-debug').hidden=false;$('debug-status').textContent='';$('debug-time').value=Number(shot.start_s).toFixed(2);state.fieldDebug=null;drawFieldDebug();
+  setHidden('field-debug',false);$('debug-status').textContent='';$('debug-time').value=Number(shot.start_s).toFixed(2);state.fieldDebug=null;drawFieldDebug();
   const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>k.annotations?.length?{timestamp_s:k.timestamp_s,annotations:k.annotations}:{timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points});updateCalibrationText();
   state.calibrationMatrices=savedCalibration.keyframes.filter(k=>Array.isArray(k.matrix)).map(k=>({timestamp_s:Number(k.timestamp_s),matrix:k.matrix}));
   state.detections=[];state.frameDetections=new Map();
@@ -231,7 +232,7 @@ function seekSource(source,button){
 }
 function loadTimingSource(){const sources=state.play?.sources||[],source=sources[Number($('timing-source').value)||0];if(!source)return;$('timing-snap').value=source.snap_s??source.start_s;$('timing-end').value=source.play_end_s??source.end_s;}
 async function selectPlay(p,button){
-  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('action-review').hidden=true;$('field-debug').hidden=true;$('overlay').classList.remove('calibrating');
+  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('action-review').hidden=true;setHidden('field-debug',true);$('overlay').classList.remove('calibrating');
   $('play-title').textContent=`Q${p.quarter??'?'} ${p.clock??''} — ${p.possession??''}`;$('play-detail').textContent=p.description;$('diagnostics').textContent=JSON.stringify({status:p.processing_status,reasons:p.reasons,metrics:p.metrics},null,2);$('film').src=`/api/video/${state.game}`;
   const sources=p.sources||[];$('sources').innerHTML='';let firstButton=null;
   for(const [i,source] of sources.entries()){const b=document.createElement('button');if(!firstButton)firstButton=b;b.textContent=`Source ${i+1} · ${source.angle} · ${(sourceEnd(source)-sourceStart(source)).toFixed(1)}s action`;b.onclick=()=>seekSource(source,b);$('sources').appendChild(b);}
