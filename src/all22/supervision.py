@@ -457,17 +457,26 @@ def hota_for_source(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: flo
         predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
     value[["aligned_x", "aligned_y"]] = predicted
     answers = {int(frame_id): group for frame_id, group in truth.groupby("frame_id")}
-    accumulator = HotaAccumulator(tau=tau)
+    # Score only the BDB frames this clip actually covers. A camera shot rarely
+    # spans the whole play, and charging the tracker for truth frames that were
+    # never filmed would measure clip boundaries rather than tracking.
+    observed = {}
     for timestamp, group in value.groupby("video_timestamp", sort=True):
         frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
-        actual = answers.get(frame_id)
-        if actual is None or actual.empty:
-            continue
+        if frame_id in answers:
+            observed[frame_id] = group
+    accumulator = HotaAccumulator(tau=tau)
+    for frame_id in sorted(observed):
+        actual, group = answers[frame_id], observed[frame_id]
         accumulator.add_frame(actual.nfl_id.astype(str).tolist(),
                               actual[["x", "y"]].to_numpy(float),
                               group.track_id.astype(str).tolist(),
                               group[["aligned_x", "aligned_y"]].to_numpy(float))
-    return accumulator.compute()
+    result = accumulator.compute()
+    result["scored_frames"] = len(observed)
+    result["truth_frames"] = len(answers)
+    result["frame_overlap"] = len(observed) / max(len(answers), 1)
+    return result
 
 
 def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: int,
