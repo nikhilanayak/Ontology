@@ -193,22 +193,19 @@ def test_protocol_evaluation_rejects_other_evaluator_versions(tmp_path: Path):
         supervision.evaluate_with_protocol(database, protocol_path, tracks_dir)
 
 
-def test_exploratory_evaluation_recovers_offset_flip_and_yard_line_shift(tmp_path: Path):
-    """Regression pin for the alignment search: these values must not move without an evaluator bump."""
+def test_evaluator_does_not_repair_absolute_yard_line_phase_from_truth(tmp_path: Path):
+    """Absolute field position is an inference output, not an evaluator free parameter."""
     database, tracks_dir, _ = prepared_case(tmp_path)
-    # Video runs .4 s ahead of the tagged snap, the field x axis is mirrored, and
-    # calibration locked onto the wrong five-yard line.
     _write_tracks(tracks_dir, "c", offset_s=.4, flip_x=True, shift_x=10.0)
     result = supervision.evaluate_audited_sources(database, "g", tracks_dir)
     source = result["results"][0]
     assert source["flip_x"] is True and source["flip_y"] is False
-    assert source["yard_line_translation_x"] == 10.0
-    assert source["snap_adjustment_s"] == pytest.approx(.4, abs=1e-9)
-    assert source["median_error_yards"] < .05
-    assert source["player_coverage"] == 1.0
-    assert source["identity_metrics"]["track_purity"] == 1.0
-    assert source["identity_metrics"]["id_switches"] == 0
-    json.dumps(result)  # output must stay JSON serializable
+    assert source["yard_line_translation_x"] == 0.0
+    # The ten-yard phase error must remain visible rather than being repaired
+    # from BDB truth, or calibration work cannot be measured.
+    assert source["median_error_yards"] > 2.0
+    assert source["hota"]["DetA"] < .7
+    json.dumps(result)
 
 
 def test_exploratory_evaluation_scores_present_sources_and_lists_skipped_ones(tmp_path: Path):

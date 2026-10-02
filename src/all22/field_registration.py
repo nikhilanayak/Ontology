@@ -702,7 +702,68 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
     return save_calibration_keyframes(db_path, clip_id, payload)
 
 
-def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1) -> list[dict]:
+def pbp_los_candidates(yard_line: Optional[str], possession: Optional[str]) -> Optional[tuple[float, float]]:
+    """Return the two orientation-ambiguous LOS coordinates on a 120-yard field.
+
+    nflverse's human-readable `yrdln` is used only when both side and possession
+    are present. The two results are mirrors about midfield; temporal/visual
+    evidence must choose between them. Special teams and malformed values fail
+    closed in the caller.
+    """
+    if not yard_line or not possession:
+        return None
+    parts = str(yard_line).upper().split()
+    if len(parts) != 2:
+        return None
+    side, number_text = parts
+    try:
+        number = int(number_text)
+    except ValueError:
+        return None
+    if number == 50 or side in {"MID", "50"}:
+        return 60.0, 60.0
+    if not 1 <= number <= 49:
+        return None
+    yardline_100 = 100 - number if side == str(possession).upper() else number
+    return 110.0 - yardline_100, 10.0 + yardline_100
+
+
+def absolute_x_phase_shift(los_estimate: float, candidates: tuple[float, float],
+                           maximum_shift: float = 10.0) -> Optional[dict]:
+    """Choose a fail-closed, five-yard-quantized absolute-x phase correction."""
+    separation = abs(candidates[0] - candidates[1])
+    if separation < 12.0:
+        return None
+    options = []
+    for candidate in candidates:
+        shift = 5.0 * round((candidate - los_estimate) / 5.0)
+        residual = abs(candidate - (los_estimate + shift))
+        if abs(shift) <= maximum_shift and residual <= 2.5:
+            options.append((abs(shift), residual, candidate, shift))
+    if not options:
+        return None
+    options.sort()
+    if len(options) > 1 and options[1][0] - options[0][0] < 5.0:
+        return None
+    _, residual, candidate, shift = options[0]
+    return {"shift_yards": float(shift), "candidate_x": float(candidate),
+            "residual_yards": float(residual), "candidate_separation_yards": float(separation)}
+
+
+def translate_registration_x(registration: Registration, shift_yards: float) -> Registration:
+    transform = np.asarray([[1.0, 0.0, shift_yards], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    matrix = transform @ registration.matrix
+    field_points = np.asarray(registration.field_points, dtype=float).copy()
+    field_points[:, 0] += shift_yards
+    diagnostics = {**registration.diagnostics,
+                   "absolute_x_source": "pbp_line_of_scrimmage",
+                   "absolute_x_shift_yards": float(shift_yards)}
+    return Registration(registration.image_points, field_points.tolist(), matrix,
+                        registration.confidence, True, diagnostics)
+
+
+def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1,
+                        absolute_from_pbp: bool = True) -> list[dict]:
     """Propagate the strongest existing calibration through a shot at detector rate.
 
     This isolates temporal camera tracking from absolute-anchor detection: it
@@ -718,7 +779,15 @@ def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1) -> list
         raise ValueError("step_s must be in (0, .5]")
     with connect(db_path) as connection:
         clip = connection.execute(
-            """SELECT c.start_s,c.end_s,g.video_path FROM clips c JOIN games g ON g.game_id=c.game_id
+            """SELECT c.start_s,c.end_s,c.angle,g.video_path,p.yard_line,p.possession,p.play_type,
+                      (SELECT snap_s FROM action_windows a WHERE a.clip_id=c.clip_id
+                       ORDER BY (a.status='verified') DESC,a.confidence DESC LIMIT 1) snap_s,
+                      (SELECT path FROM artifacts a WHERE a.clip_id=c.clip_id AND a.kind='clip_tracks'
+                       ORDER BY artifact_id DESC LIMIT 1) tracks_path
+               FROM clips c JOIN games g ON g.game_id=c.game_id
+               LEFT JOIN play_sources ps ON ps.clip_id=c.clip_id
+               LEFT JOIN play_alignments pa ON pa.play_id=ps.play_id
+               LEFT JOIN pbp_plays p ON p.game_id=pa.game_id AND p.ordinal=pa.pbp_ordinal
                WHERE c.clip_id=?""", (clip_id,),
         ).fetchone()
         rows = connection.execute(
@@ -743,6 +812,25 @@ def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1) -> list
     if not candidates:
         raise ValueError("Existing calibration has no reusable anchor correspondences")
     _, anchor_time, anchor = max(candidates)
+    # Resolve only the discrete five-yard phase from public play metadata and
+    # the snap formation. Relative geometry remains entirely film-derived.
+    phase = None
+    if (absolute_from_pbp and clip["play_type"] in {"run", "pass"} and clip["snap_s"] is not None
+            and clip["tracks_path"] and Path(clip["tracks_path"]).exists()):
+        from .field_tracking import snap_team_split
+        import pandas as pd
+        tracks = pd.read_parquet(clip["tracks_path"])
+        distance = (tracks.video_timestamp - float(clip["snap_s"])).abs()
+        snap_rows = tracks[distance <= float(distance.min()) + .02]
+        if "track_reliable" in snap_rows and bool(snap_rows.track_reliable.any()):
+            snap_rows = snap_rows[snap_rows.track_reliable]
+        positions = snap_rows.groupby("track_id").field_x.median().reset_index()
+        split = snap_team_split(positions)
+        pbp = pbp_los_candidates(clip["yard_line"], clip["possession"])
+        if split and pbp and clip["angle"] == "sideline":
+            phase = absolute_x_phase_shift(float(split["threshold"]), pbp)
+            if phase and phase["shift_yards"]:
+                anchor = translate_registration_x(anchor, phase["shift_yards"])
     capture = cv2.VideoCapture(clip["video_path"])
     if not capture.isOpened():
         raise ValueError(f"Could not open {clip['video_path']}")
@@ -786,6 +874,7 @@ def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1) -> list
             "registration_confidence": registration.confidence,
             "registration_diagnostics": {**registration.diagnostics,
                                          "dense_anchor_timestamp_s": anchor_time,
+                                         "absolute_x_phase": phase,
                                          "extension_error": error},
             "sample_timestamp_s": timestamp,
             "anchor_timestamp_s": anchor_time,

@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import pytest
 
 from all22.field_registration import OCRNumber, propagate_registration, read_field_numbers, register_field
 from all22.geometry import project_points
@@ -153,3 +154,39 @@ def test_template_mask_focuses_on_known_field_paint():
     # Paint neighborhoods are a minority of the image, not the whole field.
     fraction = float((mask > 0).mean())
     assert .01 < fraction < .5
+
+
+def test_pbp_los_candidates_and_quantized_phase_shift():
+    from all22.field_registration import absolute_x_phase_shift, pbp_los_candidates
+    assert pbp_los_candidates("BUF 25", "BUF") == (35.0, 85.0)
+    assert pbp_los_candidates("LA 25", "BUF") == (85.0, 35.0)
+    assert pbp_los_candidates("MID 50", "BUF") == (60.0, 60.0)
+    assert pbp_los_candidates(None, "BUF") is None
+    assert pbp_los_candidates("BUF xx", "BUF") is None
+    # Estimate 29.6 against candidates 35/85: choose +5, never +5.4.
+    phase = absolute_x_phase_shift(29.6, (35.0, 85.0))
+    assert phase is not None
+    assert phase["shift_yards"] == 5.0
+    assert phase["candidate_x"] == 35.0
+    assert phase["residual_yards"] == pytest.approx(.4)
+    # Midfield mirror candidates are indistinguishable and fail closed.
+    assert absolute_x_phase_shift(59.0, (60.0, 60.0)) is None
+    # More than ten yards means the relative calibration is not trustworthy.
+    assert absolute_x_phase_shift(10.0, (35.0, 85.0)) is None
+
+
+def test_field_x_translation_preserves_relative_geometry_and_projective_row():
+    from all22.field_registration import Registration, translate_registration_x
+    matrix = np.asarray([[.1, .01, 3], [.02, .2, 4], [.0001, .0002, 1]], dtype=float)
+    registration = Registration([[0, 0], [10, 0], [0, 10], [10, 10]],
+                                [[20, 5], [30, 5], [20, 15], [30, 15]],
+                                matrix, .9, False, {})
+    shifted = translate_registration_x(registration, 5.0)
+    assert np.array_equal(shifted.matrix[2], matrix[2])
+    original = np.asarray(registration.field_points)
+    moved = np.asarray(shifted.field_points)
+    assert np.allclose(moved[:, 0], original[:, 0] + 5)
+    assert np.allclose(moved[:, 1], original[:, 1])
+    assert np.allclose(np.linalg.norm(original[0] - original[3]),
+                       np.linalg.norm(moved[0] - moved[3]))
+    assert shifted.diagnostics["absolute_x_source"] == "pbp_line_of_scrimmage"

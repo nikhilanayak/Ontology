@@ -25,7 +25,7 @@ from .geometry import normalize_direction
 # Bump this whenever the BDB comparison logic (alignment search, refinement,
 # identity matching, or aggregation) changes.  Results produced by different
 # evaluator versions are not comparable and must not be reported side by side.
-EVALUATOR_VERSION = "bdb-audited-v3-hota"
+EVALUATOR_VERSION = "bdb-audited-v4-hota-no-answer-shift"
 PROTOCOL_VERSION = 1
 
 EVALUATOR_PARAMETERS: dict = {
@@ -35,8 +35,9 @@ EVALUATOR_PARAMETERS: dict = {
     "coverage_penalty_weight": 2.0,
     "fine_offset_half_range_s": .2,
     "fine_offset_step_s": .05,
-    "yard_line_translation_step_yards": 5.0,
-    "yard_line_translation_limit_yards": 50.0,
+    # Absolute yard-line phase is now an inference output. The evaluator must
+    # not repair it from BDB truth, or calibration improvements are invisible.
+    "answer_key_yard_line_translation": False,
     "refinement_gates_yards": [15.0, 10.0, 7.0],
     "refinement_ransac_threshold_yards": 2.0,
     "refinement_minimum_pairs": 30,
@@ -589,8 +590,6 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
                             (spatial_tracks.video_timestamp <= dead_s)].copy()
     identity_window = identity_tracks[(identity_tracks.video_timestamp >= snap_s) &
                                       (identity_tracks.video_timestamp <= dead_s)].copy()
-    yard_step = parameters["yard_line_translation_step_yards"]
-    yard_limit = parameters["yard_line_translation_limit_yards"]
     low, high = parameters["coarse_offset_range_s"]
     grouped_window = _tracks_by_timestamp(window)
     truth_frames = _truth_by_frame(truth)
@@ -598,8 +597,7 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     for offset in np.arange(low, high + 1e-3, parameters["coarse_offset_step_s"]):
         for flip_x in (False, True):
             for flip_y in (False, True):
-                shift_x = _five_yard_x_correction(grouped_window, truth_frames, snap_s, bdb_snap,
-                                                  float(offset), flip_x, yard_step, yard_limit)
+                shift_x = 0.0
                 errors, matched, possible = _trajectory_errors(
                     grouped_window, truth_frames, snap_s, bdb_snap, float(offset), flip_x, flip_y, shift_x)
                 if errors:
@@ -612,8 +610,7 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     refined = []
     half = parameters["fine_offset_half_range_s"]
     for offset in np.arange(coarse_offset - half, coarse_offset + half + 1e-3, parameters["fine_offset_step_s"]):
-        candidate_shift = _five_yard_x_correction(grouped_window, truth_frames, snap_s, bdb_snap,
-                                                  float(offset), flip_x, yard_step, yard_limit)
+        candidate_shift = 0.0
         errors, matched, possible = _trajectory_errors(
             grouped_window, truth_frames, snap_s, bdb_snap, float(offset), flip_x, flip_y, candidate_shift)
         if errors:
