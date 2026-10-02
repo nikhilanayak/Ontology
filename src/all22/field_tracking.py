@@ -231,13 +231,15 @@ class FieldSpaceTracker:
 
     def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
                  high_confidence: float = .55, low_confidence: float = .15,
-                 crowd_multiplier: float = 1.6, crowd_floor: int = 32):
+                 crowd_multiplier: float = 1.6, crowd_floor: int = 32,
+                 use_box_shape: bool = True):
         self.maximum_missed = maximum_missed
         self.maximum_speed_yps = maximum_speed_yps
         self.high_confidence = high_confidence
         self.low_confidence = low_confidence
         self.crowd_multiplier = crowd_multiplier
         self.crowd_floor = crowd_floor
+        self.use_box_shape = use_box_shape
         self.nominal_detection_counts: list[int] = []
         self.active: list[FieldTrack] = []
         self.next_id = 1
@@ -274,7 +276,7 @@ class FieldSpaceTracker:
                 appearance = float(np.linalg.norm(
                     (track.appearance - appearances[detection_index]) / self.appearance_scale))
                 shape_penalty = 0.0
-                if track.box_shape is not None and np.all(box_shapes[detection_index] > 0):
+                if self.use_box_shape and track.box_shape is not None and np.all(box_shapes[detection_index] > 0):
                     shape_change = np.abs(np.log(box_shapes[detection_index] / track.box_shape))
                     if float(shape_change.max()) > 1.0:
                         continue
@@ -373,12 +375,13 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
             "SELECT snap_s FROM action_windows WHERE clip_id=? AND snap_s IS NOT NULL "
             "ORDER BY (status='verified') DESC, confidence DESC LIMIT 1", (clip_id,),
         ).fetchone()
+        clip = connection.execute("SELECT angle FROM clips WHERE clip_id=?", (clip_id,)).fetchone()
     frame = assign_team_probabilities(
         pd.read_parquet(projected), float(action["snap_s"]) if action else None)
     frame = frame[frame.on_field & frame.calibration_valid].copy()
     if frame.empty:
         raise ValueError("No valid on-field detections are available for tracking")
-    tracker = FieldSpaceTracker()
+    tracker = FieldSpaceTracker(use_box_shape=not clip or clip["angle"] != "endzone")
     parts = []
     for timestamp, group in frame.groupby("video_timestamp", sort=True):
         value = group.copy()
