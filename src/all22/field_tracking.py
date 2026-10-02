@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,7 +229,20 @@ class FieldSpaceTracker:
 
     embedding_columns = tuple(f"emb_{index:02d}" for index in range(64))
     appearance_columns = ("lab_l", "lab_a", "lab_b", "hsv_h", "hsv_s", "hsv_v") + embedding_columns
-    appearance_scale = np.asarray([50, 30, 30, 45, 60, 60] + [1.0] * 64, dtype=float)
+    color_scale = (50.0, 30.0, 30.0, 45.0, 60.0, 60.0)
+    embedding_scale = 1.0
+    appearance_scale = np.asarray(list(color_scale) + [embedding_scale] * 64, dtype=float)
+    # Association cost weights and gates.  Keep these named so a config hash
+    # can be recorded with every tracks artifact.
+    appearance_weight = .8
+    appearance_memory, appearance_update = .85, .15
+    velocity_memory, velocity_update = .7, .3
+    distance_slack_yards = 1.5
+    missed_slack_yards = .15
+    team_penalty = 3.0
+    shape_gate = 1.0
+    shape_weight = .6
+    confidence_weight = .5
 
     def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
                  high_confidence: float = .55, low_confidence: float = .15,
@@ -245,6 +259,22 @@ class FieldSpaceTracker:
         self.active: list[FieldTrack] = []
         self.next_id = 1
         self.last_crowd_burst = False
+
+    def config(self) -> dict:
+        return {
+            "maximum_missed": self.maximum_missed, "maximum_speed_yps": self.maximum_speed_yps,
+            "high_confidence": self.high_confidence, "low_confidence": self.low_confidence,
+            "crowd_multiplier": self.crowd_multiplier, "crowd_floor": self.crowd_floor,
+            "use_box_shape": self.use_box_shape,
+            "color_scale": list(self.color_scale), "embedding_scale": self.embedding_scale,
+            "embedding_dimensions": len(self.embedding_columns),
+            "appearance_weight": self.appearance_weight,
+            "appearance_memory": self.appearance_memory, "appearance_update": self.appearance_update,
+            "velocity_memory": self.velocity_memory, "velocity_update": self.velocity_update,
+            "distance_slack_yards": self.distance_slack_yards, "missed_slack_yards": self.missed_slack_yards,
+            "team_penalty": self.team_penalty, "shape_gate": self.shape_gate, "shape_weight": self.shape_weight,
+            "confidence_weight": self.confidence_weight,
+        }
 
     def _appearance(self, detections: pd.DataFrame) -> np.ndarray:
         values = np.full((len(detections), len(self.appearance_columns)), np.nan, dtype=float)
@@ -266,24 +296,25 @@ class FieldSpaceTracker:
             elapsed = max(timestamp - track.timestamp, 1e-3)
             predicted = track.position + track.velocity * elapsed
             # Allow modest registration noise as well as physically plausible motion.
-            maximum_distance = self.maximum_speed_yps * elapsed + 1.5 + .15 * track.missed
+            maximum_distance = (self.maximum_speed_yps * elapsed + self.distance_slack_yards
+                                + self.missed_slack_yards * track.missed)
             for cost_column, detection_index in enumerate(detection_indices):
                 distance = float(np.linalg.norm(predicted - positions[detection_index]))
                 if distance > maximum_distance:
                     continue
                 candidate_team = teams[detection_index]
-                team_penalty = (3.0 if track.team != "unknown" and candidate_team != "unknown"
+                team_penalty = (self.team_penalty if track.team != "unknown" and candidate_team != "unknown"
                                 and track.team != candidate_team else 0.0)
                 appearance = float(np.linalg.norm(
                     (track.appearance - appearances[detection_index]) / self.appearance_scale))
                 shape_penalty = 0.0
                 if self.use_box_shape and track.box_shape is not None and np.all(box_shapes[detection_index] > 0):
                     shape_change = np.abs(np.log(box_shapes[detection_index] / track.box_shape))
-                    if float(shape_change.max()) > 1.0:
+                    if float(shape_change.max()) > self.shape_gate:
                         continue
-                    shape_penalty = .6 * float(np.linalg.norm(shape_change))
-                confidence_penalty = .5 * (1 - confidences[detection_index])
-                costs[cost_row, cost_column] = (distance + .8 * appearance + shape_penalty
+                    shape_penalty = self.shape_weight * float(np.linalg.norm(shape_change))
+                confidence_penalty = self.confidence_weight * (1 - confidences[detection_index])
+                costs[cost_row, cost_column] = (distance + self.appearance_weight * appearance + shape_penalty
                                                 + team_penalty + confidence_penalty)
         rows, columns = linear_sum_assignment(costs)
         matched_tracks = set()
@@ -295,9 +326,11 @@ class FieldSpaceTracker:
             track = self.active[track_index]
             elapsed = max(timestamp - track.timestamp, 1e-3)
             measured_velocity = (positions[detection_index] - track.position) / elapsed
-            track.velocity = .7 * track.velocity + .3 * measured_velocity
+            track.velocity = (self.velocity_memory * track.velocity
+                              + self.velocity_update * measured_velocity)
             track.position = positions[detection_index]
-            track.appearance = .85 * track.appearance + .15 * appearances[detection_index]
+            track.appearance = (self.appearance_memory * track.appearance
+                                + self.appearance_update * appearances[detection_index])
             if track.team == "unknown" and teams[detection_index] != "unknown":
                 track.team = teams[detection_index]
             track.timestamp = timestamp
@@ -370,8 +403,33 @@ class FieldSpaceTracker:
         return assigned
 
 
-def relink_tracklets(frame: pd.DataFrame, maximum_gap_s: float = .8) -> tuple[pd.DataFrame, int]:
+RELINK_PARAMETERS = {
+    "maximum_gap_s": .8,
+    "distance_gate_yps": 12.0, "distance_slack_yards": 1.5,
+    "appearance_gate": 2.25, "appearance_weight": .8,
+    "shape_gate": 1.0, "shape_weight": .5,
+}
+RELIABLE_COVERAGE_MINIMUM = .35
+
+
+def tracking_config(tracker: "FieldSpaceTracker", relink: Optional[dict] = None) -> dict:
+    return {"tracker": tracker.config(), "relink": dict(relink or RELINK_PARAMETERS),
+            "reliable_coverage_minimum": RELIABLE_COVERAGE_MINIMUM}
+
+
+def config_hash(config: dict) -> str:
+    """Short, order-independent digest shared by detections and tracks artifacts."""
+    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def relink_tracklets(frame: pd.DataFrame, maximum_gap_s: Optional[float] = None,
+                     gates: Optional[dict] = None) -> tuple[pd.DataFrame, int]:
     """Join short, non-overlapping fragments only when several cues agree."""
+    gates = dict(RELINK_PARAMETERS if gates is None else gates)
+    if maximum_gap_s is not None:
+        gates["maximum_gap_s"] = maximum_gap_s
+    maximum_gap_s = gates["maximum_gap_s"]
     if frame.empty or frame.track_id.nunique() < 2:
         return frame.copy(), 0
     summaries = {}
@@ -406,18 +464,19 @@ def relink_tracklets(frame: pd.DataFrame, maximum_gap_s: float = .8) -> tuple[pd
                 continue
             predicted = left["end_position"] + left["velocity"] * gap
             distance = float(np.linalg.norm(predicted - right["start_position"]))
-            if distance > 12 * gap + 1.5:
+            if distance > gates["distance_gate_yps"] * gap + gates["distance_slack_yards"]:
                 continue
             appearance = float(np.linalg.norm(
                 (left["appearance"] - right["appearance"]) / appearance_scale)) if len(appearance_scale) else 0
-            if not np.isfinite(appearance) or appearance > 2.25:
+            if not np.isfinite(appearance) or appearance > gates["appearance_gate"]:
                 continue
             shape = 0.0
             if left["shape"] is not None and np.all(left["shape"] > 0) and np.all(right["start_shape"] > 0):
                 shape = float(np.linalg.norm(np.log(right["start_shape"] / left["shape"])))
-                if shape > 1.0:
+                if shape > gates["shape_gate"]:
                     continue
-            candidates.append((distance + .8 * appearance + .5 * shape, predecessor, successor))
+            candidates.append((distance + gates["appearance_weight"] * appearance
+                               + gates["shape_weight"] * shape, predecessor, successor))
     used_left, used_right, links = set(), set(), {}
     for _, predecessor, successor in sorted(candidates):
         if predecessor in used_left or successor in used_right:
@@ -468,7 +527,8 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
         value["observed"] = True
         value["interpolated"] = False
         parts.append(value)
-    result, tracklet_links = relink_tracklets(pd.concat(parts, ignore_index=True))
+    relink_gates = dict(RELINK_PARAMETERS)
+    result, tracklet_links = relink_tracklets(pd.concat(parts, ignore_index=True), gates=relink_gates)
     total_frames = max(1, int(result.video_timestamp.nunique()))
     observations = result.groupby("track_id").size()
     coverage = (observations / total_frames).clip(upper=1)
@@ -476,7 +536,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     result["track_coverage"] = result.track_id.map(coverage).astype(float)
     # Keep short tracklets in the artifact for diagnosis, but mark the durable
     # trajectories that should drive action discovery and the tactical map.
-    result["track_reliable"] = result.track_coverage >= .35
+    result["track_reliable"] = result.track_coverage >= RELIABLE_COVERAGE_MINIMUM
     reliable = result[result.track_reliable]
     burst_times = result.loc[result.crowd_burst, "video_timestamp"]
     roster_pool = reliable
@@ -503,19 +563,25 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     result["roster_candidate"] = result.track_id.isin(roster_ids)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output, index=False)
+    config = tracking_config(tracker, relink_gates)
+    digest = config_hash(config)
+    summary = {"rows": len(result), "tracks": int(result.track_id.nunique()),
+               "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
+               "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
+               "tracklet_links": tracklet_links,
+               "team_labeled_fraction": float((result.team != "unknown").mean()),
+               "config_hash": digest}
     with transaction(db_path) as connection:
         game_id = connection.execute("SELECT game_id FROM clips WHERE clip_id=?", (clip_id,)).fetchone()["game_id"]
+        # Carry the calibration revision forward from the projection this run consumed.
+        projection = connection.execute(
+            """SELECT input_revision FROM artifacts WHERE clip_id=? AND kind='clip_projection' AND path=?
+               ORDER BY artifact_id DESC LIMIT 1""", (clip_id, str(Path(projected).resolve()))).fetchone()
         connection.execute(
-            "INSERT INTO artifacts(game_id,clip_id,kind,path,metadata_json) VALUES(?,?,?,?,?)",
+            """INSERT INTO artifacts(game_id,clip_id,kind,path,metadata_json,config_hash,input_revision)
+               VALUES(?,?,?,?,?,?,?)""",
             (game_id, clip_id, "clip_tracks", str(output.resolve()),
-             json.dumps({"rows": len(result), "tracks": int(result.track_id.nunique()),
-                         "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
-                         "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
-                         "tracklet_links": tracklet_links,
-                         "team_labeled_fraction": float((result.team != 'unknown').mean())})),
+             json.dumps({**summary, "config": config}), digest,
+             projection["input_revision"] if projection else None),
         )
-    return {"rows": len(result), "tracks": int(result.track_id.nunique()),
-            "reliable_tracks": int(result[result.track_reliable].track_id.nunique()),
-            "roster_tracks": int(result[result.roster_candidate].track_id.nunique()),
-            "tracklet_links": tracklet_links,
-            "team_labeled_fraction": float((result.team != "unknown").mean())}
+    return summary

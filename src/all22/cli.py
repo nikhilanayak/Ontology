@@ -183,14 +183,51 @@ def parser() -> argparse.ArgumentParser:
     pair.add_argument("video", type=Path)
 
     evaluate_sources = commands.add_parser("evaluate-audited-sources")
-    evaluate_sources.add_argument("--game-id", required=True)
+    evaluate_mode = evaluate_sources.add_mutually_exclusive_group(required=True)
+    evaluate_mode.add_argument("--protocol", type=Path,
+                               help="Frozen protocol JSON from freeze-evaluation-protocol; "
+                                    "pins sources, windows, and inputs (preferred)")
+    evaluate_mode.add_argument("--game-id",
+                               help="Exploratory mode: re-select windows from the current tracks")
     evaluate_sources.add_argument("--tracks-dir", type=Path, default=ROOT / "data" / "clip-tracks")
-    evaluate_sources.add_argument("--output", type=Path)
+    evaluate_sources.add_argument("--allow-input-drift", action="store_true",
+                                  help="With --protocol: score even if detections/calibration changed")
+    evaluate_sources.add_argument("--drift-note",
+                                  help="With --allow-input-drift: why the drift is acceptable (recorded)")
+    evaluate_sources.add_argument("--output", type=Path,
+                                  help="Must be under an ignored directory such as data/")
+
+    freeze_protocol = commands.add_parser("freeze-evaluation-protocol")
+    freeze_protocol.add_argument("--game-id", required=True)
+    freeze_protocol.add_argument("--clip-id", action="append", dest="clip_ids",
+                                 help="Restrict the frozen set to explicit audited clips (repeatable)")
+    freeze_protocol.add_argument("--tracks-dir", type=Path, default=ROOT / "data" / "clip-tracks")
+    freeze_protocol.add_argument("--output", type=Path,
+                                 help="Defaults to data/evaluation-protocols/<game-id>.json; "
+                                      "must be under an ignored directory")
 
     serve = commands.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     return root
+
+
+def _require_private_output(path: Path) -> None:
+    """Refuse to write BDB-derived evaluation artifacts anywhere Git would track them."""
+    import subprocess
+    resolved = path.resolve()
+    try:
+        inside = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=resolved.parent if resolved.parent.exists() else ROOT,
+                                capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return  # not a Git checkout; nothing can be committed from here
+    if not inside or not resolved.is_relative_to(Path(inside)):
+        return
+    ignored = subprocess.run(["git", "check-ignore", "-q", str(resolved)], cwd=inside,
+                             capture_output=True, timeout=5).returncode == 0
+    if not ignored:
+        raise SystemExit(f"Refusing to write a BDB-derived artifact to a tracked location: {resolved}. "
+                         "Use a path under data/ or another ignored directory.")
 
 
 def main() -> None:
@@ -344,8 +381,30 @@ def main() -> None:
         record = supervision.create_pair(args.db, args.manifest, args.output_dir, args.game_id,
                                          args.play_id, args.angle, args.video, args.video_snap)
         print(json.dumps(record, indent=2))
+    elif args.command == "freeze-evaluation-protocol":
+        output = args.output or ROOT / "data" / "evaluation-protocols" / f"{args.game_id}.json"
+        _require_private_output(output)
+        value = supervision.freeze_evaluation_protocol(
+            args.db, args.game_id, args.tracks_dir, output, args.clip_ids)
+        print(json.dumps({"output": str(output), "game_id": value["game_id"],
+                          "evaluator_version": value["evaluator_version"],
+                          "git_commit": value["git_commit"], "git_dirty": value["git_dirty"],
+                          "sources": [item["clip_id"] for item in value["sources"]],
+                          "skipped": value["skipped"]}, indent=2))
     elif args.command == "evaluate-audited-sources":
-        value = supervision.evaluate_audited_sources(args.db, args.game_id, args.tracks_dir)
+        if args.output:
+            _require_private_output(args.output)
+        if args.drift_note and not args.allow_input_drift:
+            raise SystemExit("--drift-note requires --allow-input-drift")
+        if args.protocol:
+            if args.allow_input_drift and not args.drift_note:
+                raise SystemExit("--allow-input-drift requires --drift-note explaining the accepted drift")
+            value = supervision.evaluate_with_protocol(
+                args.db, args.protocol, args.tracks_dir, args.allow_input_drift, args.drift_note)
+        else:
+            if args.allow_input_drift:
+                raise SystemExit("--allow-input-drift only applies with --protocol")
+            value = supervision.evaluate_audited_sources(args.db, args.game_id, args.tracks_dir)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")

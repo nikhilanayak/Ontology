@@ -1,16 +1,25 @@
+import json
 from pathlib import Path
 
 import pandas as pd
 
-from all22.db import initialize, transaction
+from all22.db import connect, initialize, transaction
 from all22.field_tracking import (
     FieldSpaceTracker,
     assign_team_probabilities,
+    config_hash,
     project_clip,
     save_calibration_keyframes,
     track_projected_clip,
+    tracking_config,
     relink_tracklets,
 )
+
+
+def test_default_tracking_config_hash_is_pinned():
+    """Changing any association weight or gate must be a deliberate, recorded decision."""
+    assert config_hash(tracking_config(FieldSpaceTracker())) == "287e337ef3ec9122"
+    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "c84e66fef7200bd4"
 
 
 def prepared_db(tmp_path: Path) -> tuple[Path, str]:
@@ -54,6 +63,15 @@ def test_keyframe_projection_and_field_tracking(tmp_path: Path):
     assert result["tracks"] == 2
     assert frame.groupby("track_id").size().tolist() == [3, 3]
     assert set(frame.team) == {"team_0", "team_1"}
+    # The tracks artifact must carry the association config and calibration revision
+    # so evaluations can be attributed to exact tracker settings.
+    with connect(database) as connection:
+        artifact = connection.execute(
+            "SELECT config_hash,input_revision,metadata_json FROM artifacts WHERE kind='clip_tracks'").fetchone()
+    assert artifact["config_hash"] == result["config_hash"]
+    assert len(artifact["config_hash"]) == 16
+    assert artifact["input_revision"] == "1"
+    assert json.loads(artifact["metadata_json"])["config"]["tracker"]["appearance_weight"] == .8
 
 
 def test_projection_marks_extrapolated_frames_invalid(tmp_path: Path):

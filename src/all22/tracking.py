@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -12,6 +11,7 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
 from .db import connect, transaction
+from .field_tracking import config_hash
 from .geometry import estimate_homography, project_points
 
 
@@ -181,8 +181,7 @@ def _clip_record(db_path: Path, clip_id: str):
 
 
 def _config_hash(value: dict) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:16]
+    return config_hash(value)
 
 
 def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10.0,

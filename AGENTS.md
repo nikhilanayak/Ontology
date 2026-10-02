@@ -10,7 +10,7 @@ Read `STATUS.md` before inspecting code or running commands. It is the durable h
 - Keep expensive work bounded. Start with explicit `--clip-id` values or a small `--limit`; inspect results before expanding. Do not launch a full-game or full-season detector run by default.
 - Run the relevant focused tests while iterating and the full suite before handoff or deployment.
 - Production is `/home/nikhil/fast/Ontology`. Always load `scripts/production-env.sh` there so caches and temporary files stay on the fast volume under `.runtime/`.
-- Never commit or push NFL footage, browser profiles, credentials, secrets, cookies, signed URLs/manifests, databases, BDB inputs or BDB-derived artifacts, detections, reconstructed tracks, evaluation outputs, or other licensed/private generated data. Keep them under ignored `downloads/`, `data/`, `.runtime/`, or another private fast-volume path.
+- Never commit or push NFL footage, browser profiles, credentials, secrets, cookies, signed URLs/manifests, databases, BDB inputs or BDB-derived artifacts, detections, reconstructed tracks, evaluation outputs, evaluation protocols, or other licensed/private generated data. Keep them under ignored `downloads/`, `data/`, `.runtime/`, or another private fast-volume path.
 
 ## Canonical commands
 
@@ -39,11 +39,24 @@ source scripts/production-env.sh
   --clip-id 'bills-at-rams-2022-reg-1:0005' \
   --detections 'data/detections/bills-at-rams-2022-reg-1/bills-at-rams-2022-reg-1:0005.parquet'
 
-# This evaluates only the already-audited/reconstructed source set; do not broaden that set first.
+# Comparable evaluation: always score against the frozen protocol. It pins the
+# source list, BDB play, action window, detections hash, calibration revision,
+# evaluator version, and evaluator parameters, and fails closed if any drift.
 .venv/bin/all22 evaluate-audited-sources \
-  --game-id bills-at-rams-2022-reg-1 \
-  --output data/bdb-audited-evaluation-next.json
+  --protocol data/evaluation-protocols/bills-at-rams-2022-reg-1.json \
+  --output data/evaluations/bills-at-rams-2022-reg-1/<label>.json
+
+# Exploratory only (re-selects windows from the tracks under test; NOT comparable across runs):
+# .venv/bin/all22 evaluate-audited-sources --game-id bills-at-rams-2022-reg-1 --output data/evaluations/<label>.json
 ```
+
+Evaluation protocol rules:
+
+- Re-freeze (`all22 freeze-evaluation-protocol --game-id ... [--clip-id ...]`) only when the audited source set, detections, calibration, or evaluator intentionally change. Freezing a new protocol starts a new comparison series; record the protocol path, its `sha256`, `git_commit`, and `git_dirty` in `STATUS.md`.
+- Bump `EVALUATOR_VERSION` in `src/all22/supervision.py` whenever alignment, refinement, identity matching, or aggregation logic changes, and route any new constant through `EVALUATOR_PARAMETERS`. Protocol evaluation refuses mismatched versions/parameters.
+- `--allow-input-drift --drift-note '<why>'` is for diagnosis only; results carrying `drift_allowed: true` must not be entered into the metrics table as comparable.
+- Tracker association weights/gates live as named attributes on `FieldSpaceTracker` and `RELINK_PARAMETERS`; their hash is pinned in `tests/test_field_tracking.py` and stored as `config_hash` on every `clip_tracks` artifact. Update the pinned hash deliberately when tuning.
+- Protocol and evaluation JSON embed BDB-derived identifiers and detections hashes: they are private artifacts and the CLI refuses to write them to a Git-tracked location. Keep them under `data/`.
 
 Deploy the committed, tested branch and verify it remotely (replace `main` only if the active deployment branch is different):
 
