@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -409,32 +410,115 @@ def diagnostic_image(frame: np.ndarray, registration: Registration) -> np.ndarra
     return output
 
 
-def propagate_registration(source: np.ndarray, target: np.ndarray,
-                           registration: Registration) -> Registration:
-    """Carry an anchored field registration through a no-cut camera motion."""
-    source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
-    target_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
-    detector = cv2.ORB_create(nfeatures=5000, fastThreshold=8)
-    source_keys, source_descriptors = detector.detectAndCompute(source_gray, _field_mask(source))
-    target_keys, target_descriptors = detector.detectAndCompute(target_gray, _field_mask(target))
+NFL_HASH_ROWS_YARDS = (70.75 / 3.0, FIELD_WIDTH - 70.75 / 3.0)
+NFL_NUMBER_ROWS_YARDS = (12.0, FIELD_WIDTH - 12.0)
+
+
+def field_template_mask(matrix: np.ndarray, frame_shape: tuple[int, ...], thickness: int = 14) -> np.ndarray:
+    height, width = frame_shape[:2]
+    inverse = np.linalg.inv(matrix)
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    def draw(first, second, line_thickness=thickness):
+        points = cv2.perspectiveTransform(
+            np.asarray([first, second], np.float32).reshape(-1, 1, 2), inverse).reshape(-1, 2)
+        if np.isfinite(points).all():
+            cv2.line(mask, tuple(np.rint(points[0]).astype(int)),
+                     tuple(np.rint(points[1]).astype(int)), 255, line_thickness)
+
+    for yard in np.arange(0.0, FIELD_LENGTH + .01, 5.0):
+        draw((yard, 0.0), (yard, FIELD_WIDTH))
+    for row in (0.0, FIELD_WIDTH, *NFL_HASH_ROWS_YARDS, *NFL_NUMBER_ROWS_YARDS):
+        draw((0.0, row), (FIELD_LENGTH, row), max(8, thickness // 2))
+    return cv2.bitwise_and(mask, _field_mask(np.zeros_like(mask) if False else np.dstack([mask] * 3))) if False else mask
+
+
+def _paint_support(frame: np.ndarray, matrix: np.ndarray, radius: int) -> np.ndarray:
+    template = field_template_mask(matrix, frame.shape, thickness=radius)
+    field = _field_mask(frame)
+    return cv2.bitwise_and(template, field)
+
+
+def _sift_matches(source_gray: np.ndarray, target_gray: np.ndarray,
+                  source_mask: np.ndarray, target_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    detector = cv2.SIFT_create(nfeatures=4000, contrastThreshold=.02, edgeThreshold=14)
+    source_keys, source_descriptors = detector.detectAndCompute(source_gray, source_mask)
+    target_keys, target_descriptors = detector.detectAndCompute(target_gray, target_mask)
     if source_descriptors is None or target_descriptors is None:
-        raise ValueError("Insufficient field features for temporal registration")
-    pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(source_descriptors, target_descriptors, k=2)
-    matches = [first for first, second in pairs if first.distance < .72 * second.distance]
-    if len(matches) < 12:
-        raise ValueError("Insufficient stable features for temporal registration")
+        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    forward = matcher.knnMatch(source_descriptors, target_descriptors, k=2)
+    reverse = matcher.knnMatch(target_descriptors, source_descriptors, k=2)
+    reverse_best = {pair[0].queryIdx: pair[0].trainIdx for pair in reverse
+                    if len(pair) == 2 and pair[0].distance < .75 * pair[1].distance}
+    matches = [pair[0] for pair in forward
+               if len(pair) == 2 and pair[0].distance < .75 * pair[1].distance
+               and reverse_best.get(pair[0].trainIdx) == pair[0].queryIdx]
     source_points = np.float32([source_keys[item.queryIdx].pt for item in matches])
     target_points = np.float32([target_keys[item.trainIdx].pt for item in matches])
-    motion, mask = cv2.findHomography(source_points, target_points, cv2.RANSAC, 3.0)
-    if motion is None or mask is None or float(mask.mean()) < .35:
-        raise ValueError("Temporal field transform was inconsistent")
+    return source_points, target_points
+
+
+def _flow_matches(source_gray: np.ndarray, target_gray: np.ndarray,
+                  source_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    corners = cv2.goodFeaturesToTrack(source_gray, maxCorners=2500, qualityLevel=.008,
+                                      minDistance=5, mask=source_mask, blockSize=7)
+    if corners is None or len(corners) < 8:
+        return np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
+    following, status, _ = cv2.calcOpticalFlowPyrLK(
+        source_gray, target_gray, corners, None, winSize=(31, 31), maxLevel=4,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
+    backward, backward_status, _ = cv2.calcOpticalFlowPyrLK(
+        target_gray, source_gray, following, None, winSize=(31, 31), maxLevel=4,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
+    error = np.linalg.norm(corners.reshape(-1, 2) - backward.reshape(-1, 2), axis=1)
+    keep = status.ravel().astype(bool) & backward_status.ravel().astype(bool) & (error < 1.25)
+    return corners.reshape(-1, 2)[keep], following.reshape(-1, 2)[keep]
+
+
+def temporal_field_motion(source: np.ndarray, target: np.ndarray,
+                          source_matrix: np.ndarray) -> tuple[np.ndarray, dict]:
+    source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    source_support = _paint_support(source, source_matrix, 24)
+    target_support = cv2.dilate(source_support, np.ones((81, 81), np.uint8))
+    target_support = cv2.bitwise_and(target_support, _field_mask(target))
+    flow_source, flow_target = _flow_matches(source_gray, target_gray, source_support)
+    sift_source, sift_target = _sift_matches(
+        source_gray, target_gray, source_support, target_support)
+    source_points = np.vstack([flow_source, sift_source]) if len(sift_source) else flow_source
+    target_points = np.vstack([flow_target, sift_target]) if len(sift_target) else flow_target
+    if len(source_points) < 16:
+        raise ValueError(f"Only {len(source_points)} static-paint temporal matches")
+    motion, inliers = cv2.findHomography(
+        source_points.astype(np.float32), target_points.astype(np.float32), cv2.RANSAC, 2.5)
+    if motion is None or inliers is None:
+        raise ValueError("Static-paint temporal homography could not be estimated")
+    ratio = float(inliers.mean())
+    if ratio < .55 or int(inliers.sum()) < 12:
+        raise ValueError(f"Static-paint temporal consensus was weak ({ratio:.2f})")
+    height, width = source.shape[:2]
+    corners = np.asarray([[0, 0], [width, 0], [width, height], [0, height]], np.float32)
+    moved = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), motion).reshape(-1, 2)
+    displacement = np.linalg.norm(moved - corners, axis=1)
+    if float(np.percentile(displacement, 90)) > .25 * np.hypot(width, height):
+        raise ValueError("Static-paint temporal motion was implausibly large")
+    return motion / motion[2, 2], {
+        "flow_matches": int(len(flow_source)), "sift_matches": int(len(sift_source)),
+        "temporal_matches": int(len(source_points)), "temporal_inliers": int(inliers.sum()),
+        "temporal_inlier_ratio": ratio,
+        "temporal_p90_displacement_pixels": float(np.percentile(displacement, 90)),
+    }
+
+
+def propagate_registration(source: np.ndarray, target: np.ndarray,
+                           registration: Registration) -> Registration:
+    motion, temporal = temporal_field_motion(source, target, registration.matrix)
     image = cv2.perspectiveTransform(
         np.asarray(registration.image_points, np.float32).reshape(-1, 1, 2), motion).reshape(-1, 2)
     calibration = estimate_homography(image, registration.field_points)
-    inlier_ratio = float(mask.mean())
-    confidence = registration.confidence * (.75 + .25 * inlier_ratio)
-    diagnostics = {**registration.diagnostics, "propagated": True,
-                   "temporal_matches": len(matches), "temporal_inlier_ratio": inlier_ratio}
+    confidence = registration.confidence * (.8 + .2 * temporal["temporal_inlier_ratio"])
+    diagnostics = {**registration.diagnostics, "propagated": True, **temporal}
     return Registration(image.tolist(), registration.field_points, calibration.matrix,
                         confidence, registration.absolute_x, diagnostics)
 
@@ -615,6 +699,97 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
             })
     finally:
         capture.release()
+    return save_calibration_keyframes(db_path, clip_id, payload)
+
+
+def densify_calibration(db_path: Path, clip_id: str, step_s: float = .1) -> list[dict]:
+    """Propagate the strongest existing calibration through a shot at detector rate.
+
+    This isolates temporal camera tracking from absolute-anchor detection: it
+    never changes which yard lines the anchor represents. It replaces sparse
+    keyframes and invalid matrix interpolation with measured frame-to-frame
+    transforms, failing closed in either direction when static paint loses
+    consensus.
+    """
+    from .db import connect
+    from .field_tracking import save_calibration_keyframes
+
+    if step_s <= 0 or step_s > .5:
+        raise ValueError("step_s must be in (0, .5]")
+    with connect(db_path) as connection:
+        clip = connection.execute(
+            """SELECT c.start_s,c.end_s,g.video_path FROM clips c JOIN games g ON g.game_id=c.game_id
+               WHERE c.clip_id=?""", (clip_id,),
+        ).fetchone()
+        rows = connection.execute(
+            """SELECT timestamp_s,landmarks_json,matrix_json FROM shot_calibration_keyframes
+               WHERE clip_id=? AND status='verified' ORDER BY timestamp_s""", (clip_id,),
+        ).fetchall()
+    if not clip or not rows:
+        raise ValueError(f"No verified calibration exists for {clip_id}")
+    candidates = []
+    for row in rows:
+        landmarks = json.loads(row["landmarks_json"])
+        confidence = float(landmarks.get("registration_confidence") or 0)
+        image_points = landmarks.get("image_points") or []
+        field_points = landmarks.get("field_points") or []
+        if len(image_points) < 4 or len(field_points) != len(image_points):
+            continue
+        registration = Registration(
+            image_points, field_points, np.asarray(json.loads(row["matrix_json"]), dtype=float),
+            confidence, bool((landmarks.get("semantic") or {}).get("absolute_x", True)),
+            landmarks.get("registration_diagnostics") or {})
+        candidates.append((confidence, float(row["timestamp_s"]), registration))
+    if not candidates:
+        raise ValueError("Existing calibration has no reusable anchor correspondences")
+    _, anchor_time, anchor = max(candidates)
+    capture = cv2.VideoCapture(clip["video_path"])
+    if not capture.isOpened():
+        raise ValueError(f"Could not open {clip['video_path']}")
+    anchor_frame = _read_frame(capture, anchor_time)
+    dense = [(anchor_time, anchor_frame, anchor, None)]
+    try:
+        for direction, target in ((-1, float(clip["start_s"])), (1, float(clip["end_s"]))):
+            timestamp, frame, value = anchor_time, anchor_frame, anchor
+            while ((direction < 0 and timestamp - step_s >= target - .02) or
+                   (direction > 0 and timestamp + step_s <= target + .02)):
+                following_time = float(np.clip(timestamp + direction * step_s,
+                                               float(clip["start_s"]), float(clip["end_s"])))
+                try:
+                    following = _read_frame(capture, following_time)
+                    following_value = propagate_registration(frame, following, value)
+                except ValueError as error:
+                    dense.append((timestamp, frame, value, str(error)))
+                    break
+                timestamp, frame, value = following_time, following, following_value
+                dense.append((timestamp, frame, value, None))
+                if timestamp == target:
+                    break
+    finally:
+        capture.release()
+    unique = []
+    for value in sorted(dense, key=lambda item: item[0]):
+        if unique and abs(value[0] - unique[-1][0]) < .03:
+            if value[2].confidence > unique[-1][2].confidence:
+                unique[-1] = value
+        else:
+            unique.append(value)
+    if len(unique) < 2:
+        raise ValueError("Temporal registration could not leave the anchor frame")
+    payload = {"keyframes": []}
+    for timestamp, _, registration, error in unique:
+        payload["keyframes"].append({
+            "timestamp_s": timestamp,
+            "image_points": registration.image_points,
+            "field_points": registration.field_points,
+            "source": "dense_static_paint_sift_v1",
+            "registration_confidence": registration.confidence,
+            "registration_diagnostics": {**registration.diagnostics,
+                                         "dense_anchor_timestamp_s": anchor_time,
+                                         "extension_error": error},
+            "sample_timestamp_s": timestamp,
+            "anchor_timestamp_s": anchor_time,
+        })
     return save_calibration_keyframes(db_path, clip_id, payload)
 
 

@@ -107,3 +107,49 @@ def test_field_line_evidence_collapses_hough_fragments_into_fitted_lines():
     cross = [item for item in evidence["fitted"] if item["kind"] == "cross_field"]
     assert 4 <= len(cross) <= 8
     assert all(item["length_pixels"] > 350 for item in cross)
+
+
+def _synthetic_registered_field(width=900, height=500):
+    frame = np.full((height, width, 3), (55, 135, 70), dtype=np.uint8)
+    # image -> field: 7 px/yd in x, 7 px/yd in y with a margin.
+    matrix = np.asarray([[1 / 7, 0, -4.0], [0, 1 / 7, -8.0], [0, 0, 1.0]], dtype=float)
+    inverse = np.linalg.inv(matrix)
+    for yard in range(10, 111, 5):
+        a = inverse @ np.asarray([yard, 0, 1.0]); a /= a[2]
+        b = inverse @ np.asarray([yard, 160 / 3, 1.0]); b /= b[2]
+        cv2.line(frame, tuple(np.rint(a[:2]).astype(int)), tuple(np.rint(b[:2]).astype(int)),
+                 (245, 245, 245), 4)
+    for row in (0, 160 / 3, 70.75 / 3, 160 / 3 - 70.75 / 3):
+        a = inverse @ np.asarray([0, row, 1.0]); a /= a[2]
+        b = inverse @ np.asarray([120, row, 1.0]); b /= b[2]
+        cv2.line(frame, tuple(np.rint(a[:2]).astype(int)), tuple(np.rint(b[:2]).astype(int)),
+                 (245, 245, 245), 3)
+    return frame, matrix
+
+
+def test_temporal_field_motion_tracks_camera_pan_and_ignores_moving_players():
+    from all22.field_registration import temporal_field_motion
+    source, matrix = _synthetic_registered_field()
+    translation = np.asarray([[1, 0, 18.0], [0, 1, -9.0], [0, 0, 1.0]], dtype=float)
+    target = cv2.warpPerspective(source, translation, (source.shape[1], source.shape[0]))
+    # Moving player-like blobs disagree with camera motion and must be RANSAC outliers.
+    cv2.rectangle(source, (300, 180), (330, 250), (10, 10, 180), -1)
+    cv2.rectangle(target, (390, 220), (420, 290), (10, 10, 180), -1)
+    motion, diagnostics = temporal_field_motion(source, target, matrix)
+    point = np.asarray([[[450.0, 250.0]]], dtype=np.float32)
+    expected = cv2.perspectiveTransform(point, translation).reshape(-1, 2)
+    actual = cv2.perspectiveTransform(point, motion).reshape(-1, 2)
+    assert np.linalg.norm(actual - expected) < 2.0
+    assert diagnostics["temporal_inliers"] >= 12
+    assert diagnostics["temporal_inlier_ratio"] >= .55
+
+
+def test_template_mask_focuses_on_known_field_paint():
+    from all22.field_registration import field_template_mask
+    frame, matrix = _synthetic_registered_field()
+    mask = field_template_mask(matrix, frame.shape)
+    assert mask.shape == frame.shape[:2]
+    assert mask.dtype == np.uint8
+    # Paint neighborhoods are a minority of the image, not the whole field.
+    fraction = float((mask > 0).mean())
+    assert .01 < fraction < .5

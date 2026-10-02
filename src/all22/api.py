@@ -219,6 +219,14 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             values.append(item)
         return {"clip_id": clip_id, "keyframes": values}
 
+    @app.post("/api/clips/{clip_id}/densify-calibration")
+    def densify_clip_calibration(clip_id: str, step_s: float = Query(.1, gt=0, le=.5)):
+        try:
+            values = field_registration.densify_calibration(db_path, clip_id, step_s)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(422, str(error)) from error
+        return {"clip_id": clip_id, "keyframes": values}
+
     @app.post("/api/clips/{clip_id}/auto-calibrate")
     def auto_calibrate(clip_id: str):
         try:

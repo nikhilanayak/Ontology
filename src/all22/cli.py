@@ -130,6 +130,9 @@ def parser() -> argparse.ArgumentParser:
     auto_calibrate.add_argument("--clip-id", required=True)
     auto_calibrate.add_argument("--diagnostics-dir", type=Path,
                                 default=ROOT / "data" / "calibration-diagnostics")
+    densify_calibration = commands.add_parser("densify-calibration")
+    densify_calibration.add_argument("--clip-id", required=True)
+    densify_calibration.add_argument("--step-s", type=float, default=.1)
 
     auto_game = commands.add_parser("auto-reconstruct-game")
     auto_game.add_argument("--game-id", required=True)
@@ -347,6 +350,9 @@ def main() -> None:
                          indent=2))
     elif args.command == "auto-calibrate-clip":
         values = field_registration.auto_calibrate_clip(args.db, args.clip_id, args.diagnostics_dir)
+        print(json.dumps({"clip_id": args.clip_id, "keyframes": values}, indent=2))
+    elif args.command == "densify-calibration":
+        values = field_registration.densify_calibration(args.db, args.clip_id, args.step_s)
         print(json.dumps({"clip_id": args.clip_id, "keyframes": values}, indent=2))
     elif args.command == "auto-reconstruct-game":
         values = field_registration.auto_reconstruct_game(
