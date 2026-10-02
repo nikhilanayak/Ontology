@@ -5,6 +5,7 @@ import pandas as pd
 from all22.db import initialize, transaction
 from all22.field_tracking import (
     FieldSpaceTracker,
+    assign_team_probabilities,
     project_clip,
     save_calibration_keyframes,
     track_projected_clip,
@@ -109,3 +110,14 @@ def test_tracker_does_not_spawn_identities_during_a_sideline_burst():
     ids = tracker.update(burst, .1)
     assert sum(value >= 0 for value in ids) == 3
     assert tracker.next_id == 4
+
+
+def test_snap_color_clusters_separate_small_official_group():
+    rows = []
+    for lab, count in [((80, 165, 90, 180), 5), ((210, 125, 135, 25), 5), ((135, 128, 128, 5), 2)]:
+        for _ in range(count):
+            rows.append({"video_timestamp": 1.0, "lab_l": lab[0], "lab_a": lab[1],
+                         "lab_b": lab[2], "hsv_s": lab[3]})
+    classified = assign_team_probabilities(pd.DataFrame(rows), anchor_timestamp=1.0)
+    assert classified.person_role.value_counts().to_dict() == {"player": 10, "official": 2}
+    assert set(classified.team) == {"team_0", "team_1", "official"}

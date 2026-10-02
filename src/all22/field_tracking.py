@@ -130,33 +130,58 @@ def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) ->
             "on_field_fraction": float(result.on_field.mean())}
 
 
-def assign_team_probabilities(frame: pd.DataFrame) -> pd.DataFrame:
+def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[float] = None) -> pd.DataFrame:
     result = frame.copy()
-    usable = result[["lab_a", "lab_b"]].astype(float).to_numpy()
+    scale_by_column = {"lab_l": 50, "lab_a": 30, "lab_b": 30, "hsv_s": 60}
+    columns = [column for column in scale_by_column if column in result]
+    usable = result[columns].astype(float).to_numpy()
     finite = np.isfinite(usable).all(axis=1)
     result["team"] = "unknown"
     result["team_confidence"] = 0.0
+    result["person_role"] = "unknown"
     if finite.sum() < 4:
         return result
-    values = usable[finite]
-    first = values[np.argmin(values[:, 0])]
-    second = values[np.argmax(np.linalg.norm(values - first, axis=1))]
-    centers = np.vstack([first, second])
+    scales = np.asarray([scale_by_column[column] for column in columns], dtype=float)
+    normalized = usable / scales
+    fit_mask = finite.copy()
+    if anchor_timestamp is not None and "video_timestamp" in result:
+        distance = (pd.to_numeric(result.video_timestamp, errors="coerce") - anchor_timestamp).abs()
+        fit_mask &= distance <= float(distance[finite].min()) + .02
+    fit_values = normalized[fit_mask]
+    clusters = 3 if anchor_timestamp is not None and len(fit_values) >= 9 else 2
+    if len(fit_values) < clusters:
+        fit_values = normalized[finite]
+        clusters = 2
+    # Deterministic farthest-point initialization avoids a sklearn dependency.
+    first = fit_values[np.argmin(fit_values[:, columns.index("lab_a")])]
+    centers = [first]
+    while len(centers) < clusters:
+        distance = np.min(np.linalg.norm(fit_values[:, None, :] - np.asarray(centers)[None, :, :], axis=2), axis=1)
+        centers.append(fit_values[np.argmax(distance)])
+    centers = np.asarray(centers)
     for _ in range(20):
-        distances = np.linalg.norm(values[:, None, :] - centers[None, :, :], axis=2)
+        distances = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2)
         labels = distances.argmin(axis=1)
-        updated = np.vstack([values[labels == index].mean(axis=0) if np.any(labels == index) else centers[index]
-                             for index in range(2)])
+        updated = np.vstack([fit_values[labels == index].mean(axis=0) if np.any(labels == index) else centers[index]
+                             for index in range(clusters)])
         if np.allclose(updated, centers):
             break
         centers = updated
+    fit_labels = np.linalg.norm(fit_values[:, None, :] - centers[None, :, :], axis=2).argmin(axis=1)
+    counts = np.bincount(fit_labels, minlength=clusters)
+    player_clusters = set(np.argsort(-counts)[:2].tolist())
+    values = normalized[finite]
     distances = np.linalg.norm(values[:, None, :] - centers[None, :, :], axis=2)
     labels = distances.argmin(axis=1)
     ordered = np.sort(distances, axis=1)
     confidence = 1 - ordered[:, 0] / np.maximum(ordered[:, 1], 1e-6)
     indices = np.flatnonzero(finite)
     confident = confidence >= .15
-    result.loc[result.index[indices[confident]], "team"] = [f"team_{value}" for value in labels[confident]]
+    team_names = {cluster: f"team_{order}" for order, cluster in enumerate(sorted(player_clusters))}
+    names = [team_names.get(int(value), "official") for value in labels[confident]]
+    result.loc[result.index[indices[confident]], "team"] = names
+    result.loc[result.index[indices[confident]], "person_role"] = [
+        "player" if name.startswith("team_") else "official" for name in names]
     result.loc[result.index[indices], "team_confidence"] = confidence
     return result
 
@@ -172,6 +197,7 @@ class FieldTrack:
     missed: int = 0
     hits: int = 1
     confidence: float = 1.0
+    box_shape: Optional[np.ndarray] = None
 
 
 class FieldSpaceTracker:
@@ -210,7 +236,7 @@ class FieldSpaceTracker:
 
     def _associate(self, track_indices: list[int], detection_indices: list[int],
                    positions: np.ndarray, appearances: np.ndarray, teams: list[str],
-                   confidences: np.ndarray, timestamp: float,
+                   confidences: np.ndarray, box_shapes: np.ndarray, timestamp: float,
                    assigned: list[int]) -> set[int]:
         if not track_indices or not detection_indices:
             return set()
@@ -230,8 +256,15 @@ class FieldSpaceTracker:
                                 and track.team != candidate_team else 0.0)
                 appearance = float(np.linalg.norm(
                     (track.appearance - appearances[detection_index]) / self.appearance_scale))
+                shape_penalty = 0.0
+                if track.box_shape is not None and np.all(box_shapes[detection_index] > 0):
+                    shape_change = np.abs(np.log(box_shapes[detection_index] / track.box_shape))
+                    if float(shape_change.max()) > 1.0:
+                        continue
+                    shape_penalty = .6 * float(np.linalg.norm(shape_change))
                 confidence_penalty = .5 * (1 - confidences[detection_index])
-                costs[cost_row, cost_column] = distance + .8 * appearance + team_penalty + confidence_penalty
+                costs[cost_row, cost_column] = (distance + .8 * appearance + shape_penalty
+                                                + team_penalty + confidence_penalty)
         rows, columns = linear_sum_assignment(costs)
         matched_tracks = set()
         for cost_row, cost_column in zip(rows, columns):
@@ -251,6 +284,9 @@ class FieldSpaceTracker:
             track.missed = 0
             track.hits += 1
             track.confidence = .8 * track.confidence + .2 * confidences[detection_index]
+            if np.all(box_shapes[detection_index] > 0):
+                track.box_shape = (.8 * track.box_shape + .2 * box_shapes[detection_index]
+                                   if track.box_shape is not None else box_shapes[detection_index].copy())
             assigned[detection_index] = track.track_id
             matched_tracks.add(track_index)
         return matched_tracks
@@ -260,6 +296,13 @@ class FieldSpaceTracker:
         positions = detections[["field_x", "field_y"]].to_numpy(float)
         appearances = self._appearance(detections)
         teams = detections.team.astype(str).tolist()
+        if {"x1", "y1", "x2", "y2"}.issubset(detections.columns):
+            box_shapes = np.column_stack([
+                detections.x2.to_numpy(float) - detections.x1.to_numpy(float),
+                detections.y2.to_numpy(float) - detections.y1.to_numpy(float),
+            ])
+        else:
+            box_shapes = np.ones((len(detections), 2), dtype=float)
         confidences = (pd.to_numeric(detections["confidence"], errors="coerce").fillna(1).to_numpy(float)
                        if "confidence" in detections else np.ones(len(detections), dtype=float))
         confidences = np.clip(confidences, 0, 1)
@@ -267,12 +310,12 @@ class FieldSpaceTracker:
             all_tracks = list(range(len(self.active)))
             high = np.flatnonzero(confidences >= self.high_confidence).tolist()
             matched_tracks = self._associate(
-                all_tracks, high, positions, appearances, teams, confidences, timestamp, assigned)
+                all_tracks, high, positions, appearances, teams, confidences, box_shapes, timestamp, assigned)
             remaining_tracks = [index for index in all_tracks if index not in matched_tracks]
             low = np.flatnonzero((confidences >= self.low_confidence)
                                  & (confidences < self.high_confidence)).tolist()
             matched_tracks |= self._associate(
-                remaining_tracks, low, positions, appearances, teams, confidences, timestamp, assigned)
+                remaining_tracks, low, positions, appearances, teams, confidences, box_shapes, timestamp, assigned)
         else:
             matched_tracks = set()
         for track_index, track in enumerate(self.active):
@@ -299,7 +342,8 @@ class FieldSpaceTracker:
             if crowd_burst:
                 continue
             track = FieldTrack(self.next_id, position, np.zeros(2), teams[index], appearances[index],
-                               timestamp, confidence=float(confidences[index]))
+                               timestamp, confidence=float(confidences[index]),
+                               box_shape=box_shapes[index].copy())
             self.active.append(track)
             assigned[index] = self.next_id
             self.next_id += 1
@@ -307,7 +351,13 @@ class FieldSpaceTracker:
 
 
 def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: Path) -> dict:
-    frame = assign_team_probabilities(pd.read_parquet(projected))
+    with connect(db_path) as connection:
+        action = connection.execute(
+            "SELECT snap_s FROM action_windows WHERE clip_id=? AND snap_s IS NOT NULL "
+            "ORDER BY (status='verified') DESC, confidence DESC LIMIT 1", (clip_id,),
+        ).fetchone()
+    frame = assign_team_probabilities(
+        pd.read_parquet(projected), float(action["snap_s"]) if action else None)
     frame = frame[frame.on_field & frame.calibration_valid].copy()
     if frame.empty:
         raise ValueError("No valid on-field detections are available for tracking")
@@ -340,11 +390,6 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     result["track_reliable"] = result.track_coverage >= .35
     reliable = result[result.track_reliable]
     burst_times = result.loc[result.crowd_burst, "video_timestamp"]
-    with connect(db_path) as connection:
-        action = connection.execute(
-            "SELECT snap_s FROM action_windows WHERE clip_id=? AND snap_s IS NOT NULL "
-            "ORDER BY (status='verified') DESC, confidence DESC LIMIT 1", (clip_id,),
-        ).fetchone()
     roster_pool = reliable
     if action and len(reliable):
         distance = (reliable.video_timestamp - float(action["snap_s"])).abs()
@@ -354,6 +399,9 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
             roster_pool = reliable[reliable.track_id.isin(snap_ids)]
     elif len(burst_times):
         roster_pool = reliable[reliable.video_timestamp < float(burst_times.min())]
+    player_pool = roster_pool[roster_pool.person_role == "player"]
+    if player_pool.track_id.nunique() >= 12:
+        roster_pool = player_pool
     roster_scores = roster_pool.groupby("track_id").agg(
         observations=("track_id", "size"),
         mean_confidence=("confidence", "mean") if "confidence" in reliable else ("track_id", "size"),
@@ -362,7 +410,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     roster_scores["score"] = (roster_scores.observations / total_frames
                               + .15 * roster_scores.mean_confidence
                               + .05 * np.minimum(roster_scores.median_speed / 3, 1))
-    roster_ids = set(roster_scores.nlargest(26, "score").index)
+    roster_ids = set(roster_scores.nlargest(22, "score").index)
     result["roster_candidate"] = result.track_id.isin(roster_ids)
     output.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output, index=False)
