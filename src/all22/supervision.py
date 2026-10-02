@@ -141,19 +141,34 @@ def create_pair(db_path: Path, manifest: Path, output_dir: Path, game_id: str, p
     return record
 
 
-def _trajectory_errors(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+def _truth_by_frame(truth: pd.DataFrame) -> dict:
+    return {int(frame_id): group[["x", "y"]].to_numpy(float)
+            for frame_id, group in truth.groupby("frame_id")}
+
+
+def _tracks_by_timestamp(tracks: pd.DataFrame) -> list[tuple[float, np.ndarray]]:
+    """Group track positions once so the alignment grid is pure numpy.
+
+    The coarse/fine search evaluates the same grouping dozens of times per
+    source; re-slicing the frame each time dominated evaluation cost.
+    """
+    return [(float(timestamp), group[["field_x", "field_y"]].to_numpy(float))
+            for timestamp, group in tracks.groupby("video_timestamp")]
+
+
+def _trajectory_errors(tracks, truth, video_snap_s: float,
                        bdb_snap_frame: int, offset_s: float, flip_x: bool,
                        flip_y: bool, shift_x: float = 0.0) -> tuple[list[float], int, int]:
-    answers = {int(frame_id): group[["x", "y"]].to_numpy(float)
-               for frame_id, group in truth.groupby("frame_id")}
+    answers = truth if isinstance(truth, dict) else _truth_by_frame(truth)
+    grouped = tracks if isinstance(tracks, list) else _tracks_by_timestamp(tracks)
     errors: list[float] = []
     matched = possible = 0
-    for timestamp, group in tracks.groupby("video_timestamp"):
+    for timestamp, positions in grouped:
         frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
         actual = answers.get(frame_id)
         if actual is None:
             continue
-        predicted = group[["field_x", "field_y"]].to_numpy(float).copy()
+        predicted = positions.copy()
         if flip_x:
             predicted[:, 0] = 120.0 - predicted[:, 0]
         if flip_y:
@@ -167,19 +182,24 @@ def _trajectory_errors(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
     return errors, matched, possible
 
 
-def _five_yard_x_correction(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+def _five_yard_x_correction(tracks, truth, video_snap_s: float,
                             bdb_snap_frame: int, offset_s: float, flip_x: bool,
                             step_yards: float = 5.0, limit_yards: float = 50.0) -> float:
-    timestamps = tracks.video_timestamp.drop_duplicates().to_numpy(float)
-    if not len(timestamps):
+    grouped = tracks if isinstance(tracks, list) else _tracks_by_timestamp(tracks)
+    if not len(grouped):
         return 0.0
+    timestamps = np.asarray([timestamp for timestamp, _ in grouped], dtype=float)
     # offset maps video time to BDB time, so this is the video frame aligned to
     # the tagged BDB snap.  Restrict the correction to repeated five-yard-line
     # ambiguity; do not fit a free transform to the answers.
     target = video_snap_s - offset_s
-    timestamp = float(timestamps[np.argmin(abs(timestamps - target))])
-    predicted = tracks[tracks.video_timestamp == timestamp].field_x.to_numpy(float)
-    actual = truth[truth.frame_id == bdb_snap_frame].x.to_numpy(float)
+    index = int(np.argmin(abs(timestamps - target)))
+    predicted = grouped[index][1][:, 0]
+    if isinstance(truth, dict):
+        rows = truth.get(int(bdb_snap_frame))
+        actual = rows[:, 0] if rows is not None else np.empty(0)
+    else:
+        actual = truth[truth.frame_id == bdb_snap_frame].x.to_numpy(float)
     if not len(predicted) or not len(actual):
         return 0.0
     if flip_x:
@@ -429,14 +449,16 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     yard_step = parameters["yard_line_translation_step_yards"]
     yard_limit = parameters["yard_line_translation_limit_yards"]
     low, high = parameters["coarse_offset_range_s"]
+    grouped_window = _tracks_by_timestamp(window)
+    truth_frames = _truth_by_frame(truth)
     searches = []
     for offset in np.arange(low, high + 1e-3, parameters["coarse_offset_step_s"]):
         for flip_x in (False, True):
             for flip_y in (False, True):
-                shift_x = _five_yard_x_correction(window, truth, snap_s, bdb_snap, float(offset), flip_x,
-                                                  yard_step, yard_limit)
+                shift_x = _five_yard_x_correction(grouped_window, truth_frames, snap_s, bdb_snap,
+                                                  float(offset), flip_x, yard_step, yard_limit)
                 errors, matched, possible = _trajectory_errors(
-                    window, truth, snap_s, bdb_snap, float(offset), flip_x, flip_y, shift_x)
+                    grouped_window, truth_frames, snap_s, bdb_snap, float(offset), flip_x, flip_y, shift_x)
                 if errors:
                     score = (float(np.median(errors))
                              + parameters["coverage_penalty_weight"] * (1 - matched / max(possible, 1)))
@@ -447,10 +469,10 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     refined = []
     half = parameters["fine_offset_half_range_s"]
     for offset in np.arange(coarse_offset - half, coarse_offset + half + 1e-3, parameters["fine_offset_step_s"]):
-        candidate_shift = _five_yard_x_correction(window, truth, snap_s, bdb_snap, float(offset), flip_x,
-                                                  yard_step, yard_limit)
+        candidate_shift = _five_yard_x_correction(grouped_window, truth_frames, snap_s, bdb_snap,
+                                                  float(offset), flip_x, yard_step, yard_limit)
         errors, matched, possible = _trajectory_errors(
-            window, truth, snap_s, bdb_snap, float(offset), flip_x, flip_y, candidate_shift)
+            grouped_window, truth_frames, snap_s, bdb_snap, float(offset), flip_x, flip_y, candidate_shift)
         if errors:
             refined.append((float(np.median(errors)), float(offset), candidate_shift, errors, matched, possible))
     median, offset, shift_x, errors, matched, possible = min(refined)
