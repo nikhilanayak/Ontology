@@ -82,18 +82,19 @@ def _matrix_at(rows, timestamp: float) -> tuple[np.ndarray, bool, float]:
     if timestamp < times[0] or timestamp > times[-1]:
         index = 0 if timestamp < times[0] else len(rows) - 1
         return np.asarray(json.loads(rows[index]["matrix_json"]), dtype=float), False, float(rows[index]["p95_error_yards"])
-    right = int(np.searchsorted(times, timestamp, side="left"))
-    if right == 0 or times[right] == timestamp:
-        row = rows[right]
-        return np.asarray(json.loads(row["matrix_json"]), dtype=float), True, float(row["p95_error_yards"])
-    left = right - 1
-    fraction = (timestamp - times[left]) / (times[right] - times[left])
-    first = np.asarray(json.loads(rows[left]["matrix_json"]), dtype=float)
-    second = np.asarray(json.loads(rows[right]["matrix_json"]), dtype=float)
-    matrix = (1 - fraction) * first + fraction * second
-    matrix /= matrix[2, 2]
-    p95 = (1 - fraction) * float(rows[left]["p95_error_yards"]) + fraction * float(rows[right]["p95_error_yards"])
-    return matrix, True, p95
+    # Homographies live in projective space; interpolating their matrix entries
+    # can become singular and made the field grid move thousands of pixels in a
+    # few seconds. Dense temporal calibration supplies a measured transform near
+    # every detector frame, so use the nearest observation honestly.
+    index = int(np.argmin(abs(times - timestamp)))
+    row = rows[index]
+    matrix = np.asarray(json.loads(row["matrix_json"]), dtype=float)
+    # Sparse legacy calibrations remain usable but are not called valid far from
+    # an observation. New dense paths are typically 0.1 s apart.
+    intervals = np.diff(times)
+    nominal = float(np.median(intervals)) if len(intervals) else .1
+    valid = abs(float(times[index]) - timestamp) <= max(.075, .75 * nominal)
+    return matrix, bool(valid), float(row["p95_error_yards"])
 
 
 def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) -> dict:

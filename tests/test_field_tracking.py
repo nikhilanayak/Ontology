@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -347,3 +348,22 @@ def test_team_resolution_propagates_to_players_absent_at_the_snap():
     resolved, diagnostics = resolve_track_teams(pd.DataFrame(rows), 10.0)
     assert diagnostics["appearance_propagated"] >= 1
     assert resolved[resolved.track_id == "late"].team.iloc[0] == "team_0"
+
+
+def test_matrix_at_uses_nearest_measured_homography_not_entrywise_interpolation():
+    """Interpolating homography entries is not valid projective geometry."""
+    import json
+    first = np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+    second = np.asarray([[2, 0, 100], [0, 2, 50], [.01, 0, 1]], dtype=float)
+    rows = [
+        {"timestamp_s": 1.0, "matrix_json": json.dumps(first.tolist()), "p95_error_yards": 1.0},
+        {"timestamp_s": 2.0, "matrix_json": json.dumps(second.tolist()), "p95_error_yards": 2.0},
+    ]
+    from all22.field_tracking import _matrix_at
+    matrix, valid, p95 = _matrix_at(rows, 1.4)
+    assert np.array_equal(matrix, first)
+    assert not np.array_equal(matrix, .6 * first + .4 * second)
+    # The nearest observed matrix is returned whole; validity is an explicit
+    # distance-to-observation decision, never evidence of interpolation.
+    assert valid is True
+    assert p95 == 1.0

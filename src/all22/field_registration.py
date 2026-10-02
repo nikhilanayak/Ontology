@@ -554,20 +554,35 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                     selected_anchors[-1] = item
             else:
                 selected_anchors.append(item)
-        candidates = [(time, frame, registration, time, None)
-                      for _, time, frame, registration in selected_anchors]
-        for target, source in ((start, selected_anchors[0]), (end, selected_anchors[-1])):
-            _, anchor_time, anchor_frame, anchor = source
-            reached_time, reached_frame, reached, error = _propagate_toward(
-                capture, anchor_time, anchor_frame, target, anchor)
-            if abs(reached_time - anchor_time) >= .20:
-                candidates.append((reached_time, reached_frame, reached, anchor_time, error))
+        # Dense temporal path: propagate frame-to-frame at the same 10 Hz used
+        # by detection/tracking. A camera pan is smooth between adjacent video
+        # frames but not between anchors six seconds apart. Keep every measured
+        # transform so projection never has to interpolate homography entries.
+        anchor_score, anchor_time, anchor_frame, anchor = max(selected_anchors, key=lambda value: value[0])
+        candidates = [(anchor_time, anchor_frame, anchor, anchor_time, None)]
+        step_s = .1
+        for direction, target in ((-1, start), (1, end)):
+            timestamp, frame, value = anchor_time, anchor_frame, anchor
+            while ((direction < 0 and timestamp - step_s >= target - .02) or
+                   (direction > 0 and timestamp + step_s <= target + .02)):
+                following_time = float(np.clip(timestamp + direction * step_s, start, end))
+                try:
+                    following = _read_frame(capture, following_time)
+                    following_value = propagate_registration(frame, following, value)
+                except ValueError as error:
+                    # Stop this direction at the last trustworthy transform;
+                    # never bridge a failed segment by matrix interpolation.
+                    candidates.append((timestamp, frame, value, anchor_time, str(error)))
+                    break
+                timestamp, frame, value = following_time, following, following_value
+                candidates.append((timestamp, frame, value, anchor_time, None))
+                if timestamp == target:
+                    break
 
-        # Collapse timestamps reached from different anchors, preferring the
-        # higher-confidence registration at each instant.
+        # Collapse numerical duplicate timestamps, preferring higher confidence.
         selected = []
         for candidate in sorted(candidates, key=lambda value: value[0]):
-            if selected and abs(candidate[0] - selected[-1][0]) < .10:
+            if selected and abs(candidate[0] - selected[-1][0]) < .03:
                 if candidate[2].confidence > selected[-1][2].confidence:
                     selected[-1] = candidate
             else:
@@ -585,7 +600,7 @@ def auto_calibrate_clip(db_path: Path, clip_id: str, diagnostics_dir: Path,
                 "timestamp_s": timestamp,
                 "image_points": registration.image_points,
                 "field_points": registration.field_points,
-                "source": "automatic_lines_ocr_v2_partial_interval",
+                "source": "automatic_lines_ocr_v3_dense_temporal",
                 "registration_confidence": registration.confidence,
                 "registration_diagnostics": {
                     **registration.diagnostics,

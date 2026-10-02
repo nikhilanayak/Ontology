@@ -93,3 +93,17 @@ def test_verification_rejects_physically_impossible_registrations():
     assert not verify_registration(skewed, shape)["verified"]
     # Singular.
     assert not verify_registration(np.zeros((3, 3)), shape)["verified"]
+
+
+def test_field_line_evidence_collapses_hough_fragments_into_fitted_lines():
+    from all22.field_registration import _field_mask, detect_field_line_evidence, detect_yard_lines
+    frame = np.full((500, 900, 3), (60, 140, 70), dtype=np.uint8)
+    # Six thick lines: Hough sees two edges and multiple fragments for each.
+    for x in range(120, 800, 120):
+        cv2.line(frame, (x, 40), (x, 460), (245, 245, 245), 7)
+    lines, mask, white = detect_yard_lines(frame)
+    evidence = detect_field_line_evidence(frame, mask, white, lines)
+    assert evidence["raw_count"] > len(evidence["fitted"])
+    cross = [item for item in evidence["fitted"] if item["kind"] == "cross_field"]
+    assert 4 <= len(cross) <= 8
+    assert all(item["length_pixels"] > 350 for item in cross)
