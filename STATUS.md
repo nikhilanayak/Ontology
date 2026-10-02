@@ -8,7 +8,7 @@ Do not run the full season yet. The immediate objective is to improve and valida
 
 ## Current state
 
-- Deployed commit: **`14ffe8f`** (`Freeze a reproducible BDB evaluation protocol`) on production, GitHub `origin/main`, and local. Remote suite: **65 passed** (`.venv/bin/python -m pytest -q`, 2026-10-02). Viewer restarted and `GET /api/games` verified.
+- Deployed application commit: **`55c075e`** (`Add standalone Hough line preview`) on production and GitHub `origin/main`. Remote suite: **106 passed** (`source scripts/production-env.sh && .venv/bin/python -m pytest -q`, 2026-10-02). Viewer restarted; `GET /api/games`, `/hough`, `/api/hough/clips`, and a real annotated-frame JPEG verified.
 - Handoff documents were added and pushed in `dc0d9a1` (`Document agent workflow and project handoff`). Future agents must run `git rev-parse HEAD` and compare local, GitHub, and production before changing or deploying code.
 - Local tooling: Python 3.13 venv at `/Users/nnayak/Ontology/.venv` (ignored); `gh` installed via Homebrew and authenticated as `nikhilanayak`; `origin` is HTTPS with `gh auth setup-git` credentials. `npm`/`node` are not installed locally, so `npm run cv:test` must be replaced by `.venv/bin/python -m pytest -q` here.
 - Implemented: semantic field calibration, keyframed field tracking, crowd gating, role-aware tracking, camera-angle scale gating, tracklet relinking, identity evaluation, 64-dimensional ResNet18 appearance embeddings, separation of spatial observations from durable identity evaluation, and a **frozen evaluation protocol** (see below).
@@ -321,7 +321,7 @@ verified bit-identical on 180 real grid points (max abs difference `0.000e+00`).
 
 Canonical test, deployment, bounded experiment, and server-restart commands are maintained in `AGENTS.md`. Update this file immediately after the next experiment or deployment with the exact commit, command, source set, artifact path, and metrics.
 
-## Standalone Hough line preview (local, uncommitted — 2026-10-02)
+## Standalone Hough line preview (deployed `55c075e` — 2026-10-02)
 
 The prior calibration/tracking direction is paused. A new standalone experiment now applies only
 generic Canny edge detection and `cv2.HoughLinesP` to a decoded video frame, then draws every raw
@@ -340,5 +340,10 @@ interpretation, calibration, detection, or tracking dependency.
   from both registered games. All six 1920x1080 frames decoded and rendered. Raw line counts were
   Bills-Rams: **518 / 489 / 479**; Lions-Chiefs: **988 / 859 / 559**. Generated probe JPEGs remain
   private under production `.runtime/`; no footage or derived image entered Git.
-- Deployment state: **local only, uncommitted, not deployed**. The unrelated pre-existing local
-  modification in `src/all22/field_registration.py` was preserved and not touched by this work.
+- Deployment: committed and pushed as **`55c075e`**, fast-forwarded production from `4c810c0`,
+  and ran `source scripts/production-env.sh && .venv/bin/python -m pytest -q`: **106 passed** with
+  one existing `StarletteDeprecationWarning`. Restarted `.venv/bin/all22 serve` on `127.0.0.1:8000`.
+  Production verification: `/api/games` 200, `/hough` 200, `/api/hough/clips` returned **634**
+  clips, and `bills-at-rams-2022-reg-1:0005/annotated.jpg` returned 200 (**275,368 bytes**).
+- The unrelated pre-existing local modification in `src/all22/field_registration.py` remains
+  preserved and was not included in `55c075e`.
