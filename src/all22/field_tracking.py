@@ -523,6 +523,7 @@ def tracking_config(tracker: "FieldSpaceTracker", relink: Optional[dict] = None)
     return {"tracker": tracker.config(), "relink": dict(relink or RELINK_PARAMETERS),
             "reliable_coverage_minimum": RELIABLE_COVERAGE_MINIMUM,
             "reliability_window": "clip",
+            "global_association": dict(GLOBAL_ASSOCIATION_PARAMETERS),
             "team": {"official_cluster_fraction": OFFICIAL_CLUSTER_FRACTION,
                      "official_cluster_floor": OFFICIAL_CLUSTER_FLOOR,
                      "confidence_minimum": TEAM_CONFIDENCE_MINIMUM,
@@ -675,6 +676,10 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     result, tracker = _run_tracker(frame, clip_id, angle)
     relink_gates = dict(RELINK_PARAMETERS)
     result, tracklet_links = relink_tracklets(result, gates=relink_gates)
+    global_parameters = dict(GLOBAL_ASSOCIATION_PARAMETERS)
+    global_diagnostics = {"links": 0}
+    if global_parameters.get("enabled"):
+        result, global_diagnostics = associate_tracklets_globally(result, global_parameters)
     result, team_diagnostics = resolve_track_teams(result, snap_s)
     # Durability is judged over the whole shot. A play-span denominator was
     # measured on the frozen protocol and made identity worse (+3.5 switches/100):
@@ -723,6 +728,7 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
                "tracklet_links": tracklet_links,
                "team_labeled_fraction": float((result.team != "unknown").mean()),
                "estimated_window": list(window) if window else None,
+               "global_links": global_diagnostics.get("links", 0),
                "team_assignment": team_diagnostics,
                "config_hash": digest}
     with transaction(db_path) as connection:
@@ -739,3 +745,117 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
              projection["input_revision"] if projection else None),
         )
     return summary
+
+
+GLOBAL_ASSOCIATION_PARAMETERS = {
+    "enabled": True,
+    "maximum_gap_s": 2.5,
+    "maximum_speed_yps": 11.0,
+    "position_slack_yards": 2.0,
+    "appearance_weight": .5,
+    "appearance_gate": 2.0,
+    "minimum_observations": 3,
+}
+
+
+def _tracklet_summaries(frame: pd.DataFrame, columns: list[str]) -> dict:
+    summaries = {}
+    for track_id, rows in frame.groupby("track_id"):
+        rows = rows.sort_values("video_timestamp")
+        first, last = rows.iloc[0], rows.iloc[-1]
+        team_values = rows.loc[rows.team != "unknown", "team"] if "team" in rows else pd.Series(dtype=str)
+        summaries[track_id] = {
+            "start": float(first.video_timestamp), "end": float(last.video_timestamp),
+            "start_position": first[["field_x", "field_y"]].to_numpy(float),
+            "end_position": last[["field_x", "field_y"]].to_numpy(float),
+            "velocity": np.asarray([float(last.get("vx", 0) or 0), float(last.get("vy", 0) or 0)]),
+            "appearance": rows[columns].median().to_numpy(float) if columns else np.zeros(0),
+            "team": str(team_values.mode().iloc[0]) if len(team_values) else "unknown",
+            "observations": int(len(rows)),
+        }
+    return summaries
+
+
+def associate_tracklets_globally(frame: pd.DataFrame,
+                                 parameters: Optional[dict] = None) -> tuple[pd.DataFrame, dict]:
+    """Chain tracklets into whole-play trajectories using offline constraints.
+
+    This pipeline is batch, so the entire clip is available at once. Two facts
+    make the problem far more constrained than general multi-object tracking:
+    tracklets that overlap in time cannot belong to the same player, and a
+    football play contains a known, small number of participants. Chains are
+    built greedily under those hard constraints, cheapest compatible link first.
+    """
+    parameters = dict(GLOBAL_ASSOCIATION_PARAMETERS if parameters is None else parameters)
+    diagnostics = {"links": 0, "tracks_before": 0, "tracks_after": 0}
+    if frame.empty or "track_id" not in frame or frame.track_id.nunique() < 2:
+        return frame.copy(), diagnostics
+    columns = [column for column in FieldSpaceTracker.appearance_columns if column in frame]
+    scale_lookup = dict(zip(FieldSpaceTracker.appearance_columns, FieldSpaceTracker.appearance_scale))
+    appearance_scale = np.asarray([scale_lookup[column] for column in columns]) if columns else np.zeros(0)
+    summaries = _tracklet_summaries(frame, columns)
+    diagnostics["tracks_before"] = len(summaries)
+    eligible = {track: value for track, value in summaries.items()
+                if value["observations"] >= parameters["minimum_observations"]}
+    candidates = []
+    for predecessor, left in eligible.items():
+        for successor, right in eligible.items():
+            if predecessor == successor:
+                continue
+            gap = right["start"] - left["end"]
+            # Hard constraint: overlapping tracklets are different players.
+            if gap <= 0 or gap > parameters["maximum_gap_s"]:
+                continue
+            if (left["team"] != "unknown" and right["team"] != "unknown"
+                    and left["team"] != right["team"]):
+                continue
+            predicted = left["end_position"] + left["velocity"] * gap
+            reachable = parameters["maximum_speed_yps"] * gap + parameters["position_slack_yards"]
+            distance = float(np.linalg.norm(predicted - right["start_position"]))
+            straight = float(np.linalg.norm(right["start_position"] - left["end_position"]))
+            if min(distance, straight) > reachable:
+                continue
+            appearance = 0.0
+            if len(appearance_scale):
+                appearance = float(np.linalg.norm(
+                    (left["appearance"] - right["appearance"]) / appearance_scale))
+                if not np.isfinite(appearance) or appearance > parameters["appearance_gate"]:
+                    continue
+            cost = min(distance, straight) + parameters["appearance_weight"] * appearance
+            candidates.append((cost, gap, predecessor, successor))
+    # Greedy cheapest-first chaining. Each tracklet keeps at most one
+    # predecessor and one successor, so chains stay simple paths.
+    successor_of: dict = {}
+    predecessor_of: dict = {}
+    def chain_end(track):
+        seen = set()
+        while track in successor_of and track not in seen:
+            seen.add(track)
+            track = successor_of[track]
+        return track
+    def chain_start(track):
+        seen = set()
+        while track in predecessor_of and track not in seen:
+            seen.add(track)
+            track = predecessor_of[track]
+        return track
+    for cost, gap, predecessor, successor in sorted(candidates):
+        if predecessor in successor_of or successor in predecessor_of:
+            continue
+        if chain_start(predecessor) == chain_start(successor):
+            continue
+        # Reject if the merged chain would overlap itself in time.
+        head, tail = chain_start(predecessor), chain_end(successor)
+        if summaries[tail]["end"] < summaries[head]["start"]:
+            continue
+        successor_of[predecessor] = successor
+        predecessor_of[successor] = predecessor
+    identity = {}
+    for track in summaries:
+        identity[track] = chain_start(track)
+    result = frame.copy()
+    result["global_track_id"] = result.track_id.map(identity)
+    result["track_id"] = result.global_track_id
+    diagnostics["links"] = len(successor_of)
+    diagnostics["tracks_after"] = int(result.track_id.nunique())
+    return result.drop(columns=["global_track_id"]), diagnostics

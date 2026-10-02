@@ -6,6 +6,7 @@ import pandas as pd
 from all22.db import connect, initialize, transaction
 from all22.field_tracking import (
     FieldSpaceTracker,
+    associate_tracklets_globally,
     assign_team_probabilities,
     config_hash,
     project_clip,
@@ -20,8 +21,8 @@ from all22.field_tracking import (
 
 def test_default_tracking_config_hash_is_pinned():
     """Changing any association weight or gate must be a deliberate, recorded decision."""
-    assert config_hash(tracking_config(FieldSpaceTracker())) == "750a0c25b6ac3e97"
-    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "e8cca3f7e8d62d8b"
+    assert config_hash(tracking_config(FieldSpaceTracker())) == "66e9682a0209126f"
+    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "291dec2f8e9e5526"
 
 
 def prepared_db(tmp_path: Path) -> tuple[Path, str]:
@@ -223,3 +224,48 @@ def test_tracking_does_not_read_action_windows(tmp_path: Path):
     assert first["tracks"] == second["tracks"]
     assert first["estimated_window"] == second["estimated_window"]
     assert pd.read_parquet(tmp_path / "a.parquet").equals(pd.read_parquet(tmp_path / "b.parquet"))
+
+
+def test_global_association_chains_tracklets_but_never_merges_overlapping_ones():
+    """Two tracklets overlapping in time cannot be the same player."""
+    rows = []
+    # a -> b: a clean temporal gap along a consistent heading.
+    for step in range(6):
+        rows.append({"track_id": "a", "video_timestamp": 10.0 + .1 * step,
+                     "field_x": 20.0 + step, "field_y": 25.0, "vx": 10.0, "vy": 0.0,
+                     "team": "team_0", "lab_l": 50, "lab_a": 10, "lab_b": 10,
+                     "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    for step in range(6):
+        rows.append({"track_id": "b", "video_timestamp": 11.0 + .1 * step,
+                     "field_x": 30.0 + step, "field_y": 25.0, "vx": 10.0, "vy": 0.0,
+                     "team": "team_0", "lab_l": 50, "lab_a": 10, "lab_b": 10,
+                     "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    # c overlaps a exactly and must stay separate however similar it looks.
+    for step in range(6):
+        rows.append({"track_id": "c", "video_timestamp": 10.0 + .1 * step,
+                     "field_x": 20.3 + step, "field_y": 25.4, "vx": 10.0, "vy": 0.0,
+                     "team": "team_0", "lab_l": 50, "lab_a": 10, "lab_b": 10,
+                     "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    frame = pd.DataFrame(rows)
+    result, diagnostics = associate_tracklets_globally(frame)
+    assert diagnostics["links"] == 1
+    assert result[result.index.isin(frame.index[frame.track_id == "a"])].track_id.nunique() == 1
+    merged = dict(zip(frame.track_id, result.track_id))
+    assert merged["a"] == merged["b"], "the gapped pair should chain"
+    assert merged["c"] != merged["a"], "time-overlapping tracklets must not merge"
+    assert result.track_id.nunique() == 2
+
+
+def test_global_association_respects_reachable_distance_and_team():
+    rows = []
+    for track, x, team in (("a", 20.0, "team_0"), ("b", 95.0, "team_0"), ("d", 24.0, "team_1")):
+        start = 10.0 if track == "a" else 11.0
+        for step in range(5):
+            rows.append({"track_id": track, "video_timestamp": start + .1 * step,
+                         "field_x": x + .1 * step, "field_y": 25.0, "vx": 0.0, "vy": 0.0,
+                         "team": team, "lab_l": 50, "lab_a": 10, "lab_b": 10,
+                         "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    result, diagnostics = associate_tracklets_globally(pd.DataFrame(rows))
+    # b is 75 yd away (unreachable in 0.6 s) and d is the other team.
+    assert diagnostics["links"] == 0
+    assert result.track_id.nunique() == 3
