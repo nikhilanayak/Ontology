@@ -158,12 +158,13 @@ SNAP_SEPARATION_MINIMUM_GAP_YARDS = .75
 
 
 def snap_team_split(snap_rows: pd.DataFrame) -> Optional[dict]:
-    """Split the snap formation across the line of scrimmage.
+    """Locate the line of scrimmage from the densest snap-time player band.
 
-    At the snap the two teams occupy disjoint ranges of ``field_x``: in BDB truth
-    a single x threshold separates them perfectly. That is a far stronger signal
-    than jersey colour under stadium lighting, so it is used to supervise the
-    colour clustering rather than the other way round.
+    The former largest-gap rule selected the linebacker-to-safety gap in two-high
+    coverages, producing impossible 31-v-6 team splits. The LOS is instead where
+    football players are most concentrated: offensive/defensive lines plus tight
+    ends and box defenders. Find that band, then use the nearest neutral-zone gap
+    only as a validity check and precise boundary.
     """
     if snap_rows.empty or "field_x" not in snap_rows:
         return None
@@ -172,19 +173,27 @@ def snap_team_split(snap_rows: pd.DataFrame) -> Optional[dict]:
     if len(values) < SNAP_SEPARATION_MINIMUM_PLAYERS:
         return None
     ordered = np.sort(values)
+    # Search a quarter-yard grid for the most occupied two-yard band.
+    grid = np.arange(ordered.min(), ordered.max() + .251, .25)
+    counts = np.asarray([np.sum(np.abs(ordered - center) <= 1.0) for center in grid])
+    maximum = int(counts.max())
+    if maximum < 6:
+        return None
+    centers = grid[counts == maximum]
+    dense_center = float(np.median(centers))
     gaps = np.diff(ordered)
-    # Only consider splits that leave a plausible unit on each side.
-    margin = max(4, int(.25 * len(ordered)))
-    interior = slice(margin - 1, len(gaps) - margin + 1)
-    if interior.start >= interior.stop:
+    candidates = []
+    for index, gap in enumerate(gaps):
+        threshold = float((ordered[index] + ordered[index + 1]) / 2)
+        left, right = index + 1, len(ordered) - index - 1
+        if (gap >= SNAP_SEPARATION_MINIMUM_GAP_YARDS and left >= 8 and right >= 8
+                and abs(threshold - dense_center) <= 3.0):
+            candidates.append((abs(threshold - dense_center), -float(gap), threshold, float(gap), left, right))
+    if not candidates:
         return None
-    offset = int(np.argmax(gaps[interior])) + interior.start
-    gap = float(gaps[offset])
-    if gap < SNAP_SEPARATION_MINIMUM_GAP_YARDS:
-        return None
-    threshold = float((ordered[offset] + ordered[offset + 1]) / 2)
-    return {"threshold": threshold, "gap_yards": gap,
-            "left": int((values < threshold).sum()), "right": int((values > threshold).sum())}
+    _, _, threshold, gap, left, right = min(candidates)
+    return {"threshold": threshold, "gap_yards": gap, "dense_center": dense_center,
+            "dense_players": maximum, "left": left, "right": right}
 
 
 def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[float] = None) -> pd.DataFrame:

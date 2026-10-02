@@ -367,3 +367,23 @@ def test_matrix_at_uses_nearest_measured_homography_not_entrywise_interpolation(
     # distance-to-observation decision, never evidence of interpolation.
     assert valid is True
     assert p95 == 1.0
+
+
+def test_snap_team_split_uses_dense_los_not_two_high_safety_gap():
+    # Eleven offensive players around the LOS, nine box defenders, two deep
+    # safeties. The safety gap is larger than the neutral zone and fooled the
+    # former largest-gap estimator into a 16-v-6 split.
+    values = ([57.5, 58.0, 58.6, 59.0, 59.3, 59.6, 59.9, 60.1, 60.3, 60.6, 61.0]
+              + [61.8, 62.0, 62.2, 62.4, 62.7, 63.0, 63.4, 64.0, 65.0]
+              + [74.5, 76.0])
+    split = snap_team_split(pd.DataFrame({"field_x": values}))
+    assert split is not None
+    assert abs(split["threshold"] - 61.4) <= 1.0
+    assert min(split["left"], split["right"]) >= 8
+    assert split["dense_players"] >= 6
+
+
+def test_snap_team_split_fails_closed_on_kickoff_geometry():
+    # Two units separated by forty yards are not a scrimmage formation.
+    values = list(np.linspace(25, 30, 11)) + list(np.linspace(70, 75, 11))
+    assert snap_team_split(pd.DataFrame({"field_x": values})) is None
