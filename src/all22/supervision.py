@@ -198,6 +198,57 @@ def refine_with_bdb_tracks(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap
             "held_out_p90_error_yards": float(np.percentile(errors, 90))}
 
 
+def identity_metrics(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+                     bdb_snap_frame: int, offset_s: float, flip_x: bool, flip_y: bool,
+                     shift_x: float, correction_matrix: list, maximum_error: float = 8.0) -> dict:
+    """Measure anonymous track consistency after spatial/time alignment to BDB."""
+    if "track_id" not in tracks or "nfl_id" not in truth:
+        return {"matched_assignments": 0, "track_purity": 0.0, "id_switches": 0,
+                "switches_per_100_assignments": 0.0, "mean_fragments_per_player": 0.0}
+    value = tracks.copy()
+    predicted = value[["field_x", "field_y"]].to_numpy(float)
+    if flip_x:
+        predicted[:, 0] = 120.0 - predicted[:, 0]
+    if flip_y:
+        predicted[:, 1] = 160.0 / 3.0 - predicted[:, 1]
+    predicted[:, 0] += shift_x
+    correction = np.asarray(correction_matrix, dtype=float)
+    predicted = cv2.perspectiveTransform(
+        predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
+    value[["aligned_x", "aligned_y"]] = predicted
+    answers = {int(frame_id): group for frame_id, group in truth.groupby("frame_id")}
+    assignments = []
+    for timestamp, group in value.groupby("video_timestamp", sort=True):
+        frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
+        actual = answers.get(frame_id)
+        if actual is None or actual.empty:
+            continue
+        distances = np.linalg.norm(
+            actual[["x", "y"]].to_numpy(float)[:, None, :]
+            - group[["aligned_x", "aligned_y"]].to_numpy(float)[None, :, :], axis=2)
+        actual_index, predicted_index = linear_sum_assignment(distances)
+        for left, right in zip(actual_index, predicted_index):
+            error = float(distances[left, right])
+            if error <= maximum_error:
+                assignments.append((float(timestamp), str(group.iloc[right].track_id),
+                                    str(actual.iloc[left].nfl_id), error))
+    if not assignments:
+        return {"matched_assignments": 0, "track_purity": 0.0, "id_switches": 0,
+                "switches_per_100_assignments": 0.0, "mean_fragments_per_player": 0.0}
+    matched = pd.DataFrame(assignments, columns=["timestamp", "track_id", "nfl_id", "error"])
+    majority = matched.groupby("track_id").nfl_id.value_counts().groupby(level=0).max()
+    purity = float(majority.sum() / len(matched))
+    switches = 0
+    for _, rows in matched.sort_values("timestamp").groupby("nfl_id"):
+        identities = rows.track_id.to_numpy()
+        switches += int(np.sum(identities[1:] != identities[:-1]))
+    fragments = matched.groupby("nfl_id").track_id.nunique()
+    return {"matched_assignments": len(matched), "track_purity": purity,
+            "id_switches": switches, "switches_per_100_assignments": 100 * switches / len(matched),
+            "mean_fragments_per_player": float(fragments.mean()),
+            "median_assignment_error_yards": float(matched.error.median())}
+
+
 def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> dict:
     """Compare reconstructed, human-verified sources with matching BDB truth."""
     with connect(db_path) as connection:
@@ -285,6 +336,9 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
             bdb_refinement = refine_with_bdb_tracks(
                 window, truth, float(selected["snap_s"]), bdb_snap, offset,
                 flip_x, flip_y, shift_x)
+            identities = identity_metrics(
+                window, truth, float(selected["snap_s"]), bdb_snap, offset,
+                flip_x, flip_y, shift_x, bdb_refinement["correction_matrix"])
             results.append({
                 "clip_id": clip_id, "bdb_play_id": play_id, "action_id": selected["action_id"],
                 "candidate_actions": len(candidates), "selection_cost": float(selection_cost),
@@ -294,6 +348,7 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                 "player_coverage": matched / max(possible, 1),
                 "median_error_yards": median, "p90_error_yards": float(np.percentile(errors, 90)),
                 "bdb_refinement": bdb_refinement,
+                "identity_metrics": identities,
             })
     if not results:
         raise ValueError("No audited reconstructed sources overlap BDB plays")
@@ -303,5 +358,9 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
         "median_source_coverage": float(np.median([row["player_coverage"] for row in results])),
         "median_refined_held_out_error_yards": float(np.median([
             row["bdb_refinement"]["held_out_median_error_yards"] for row in results])),
+        "median_track_purity": float(np.median([
+            row["identity_metrics"]["track_purity"] for row in results])),
+        "median_switches_per_100_assignments": float(np.median([
+            row["identity_metrics"]["switches_per_100_assignments"] for row in results])),
         "results": results,
     }
