@@ -497,7 +497,9 @@ def formation_accuracy(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
     window = parameters["formation_window_s"]
     accurate = parameters["formation_accurate_yards"]
     isolation = parameters["isolation_yards"]
-    empty = {"snap_players_truth": 0, "snap_players_matched": 0, "snap_recall": 0.0,
+    empty = {"reference_frame": None, "snap_frame": int(bdb_snap_frame),
+             "snap_frame_covered": False,
+             "snap_players_truth": 0, "snap_players_matched": 0, "snap_recall": 0.0,
              "snap_median_error_yards": None, "snap_p90_error_yards": None,
              "snap_within_tolerance": 0.0, "isolated_recall": 0.0,
              "isolated_median_error_yards": None}
@@ -515,6 +517,17 @@ def formation_accuracy(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
         predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
     value[["aligned_x", "aligned_y"]] = predicted
     answers = {int(frame_id): group for frame_id, group in truth.groupby("frame_id")}
+    # Many shots start after the snap, so anchor the formation measurement on the
+    # earliest covered frame when the snap itself was never filmed. Otherwise the
+    # metric reports clip coverage rather than formation accuracy.
+    covered = sorted(
+        frame_id for frame_id in (
+            bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
+            for timestamp in value.video_timestamp.unique())
+        if frame_id in answers)
+    if not covered:
+        return empty
+    reference = bdb_snap_frame if bdb_snap_frame in covered else covered[0]
     snap_errors: list[float] = []
     snap_truth = snap_matched = 0
     isolated_errors: list[float] = []
@@ -529,7 +542,7 @@ def formation_accuracy(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
         distances = np.linalg.norm(truth_points[:, None, :] - track_points[None, :, :], axis=2)
         rows, columns = linear_sum_assignment(distances)
         paired = {int(row): float(distances[row, column]) for row, column in zip(rows, columns)}
-        at_snap = abs(frame_id - bdb_snap_frame) <= round(window * 10)
+        at_snap = abs(frame_id - reference) <= round(window * 10)
         spacing = np.linalg.norm(truth_points[:, None, :] - truth_points[None, :, :], axis=2)
         np.fill_diagonal(spacing, np.inf)
         nearest_neighbour = spacing.min(axis=1)
@@ -546,6 +559,8 @@ def formation_accuracy(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: 
                     isolated_matched += 1
                     isolated_errors.append(error)
     return {
+        "reference_frame": int(reference), "snap_frame": int(bdb_snap_frame),
+        "snap_frame_covered": bool(bdb_snap_frame in covered),
         "snap_players_truth": snap_truth, "snap_players_matched": snap_matched,
         "snap_recall": snap_matched / max(snap_truth, 1),
         "snap_median_error_yards": float(np.median(snap_errors)) if snap_errors else None,
