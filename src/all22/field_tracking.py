@@ -131,8 +131,8 @@ def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) ->
             "on_field_fraction": float(result.on_field.mean())}
 
 
-OFFICIAL_CLUSTER_FRACTION = .30
-OFFICIAL_CLUSTER_FLOOR = 4
+OFFICIAL_CLUSTER_FRACTION = .18
+OFFICIAL_CLUSTER_FLOOR = 2
 TEAM_CONFIDENCE_MINIMUM = .15
 SNAP_SEPARATION_MINIMUM_PLAYERS = 12
 SNAP_SEPARATION_MINIMUM_GAP_YARDS = .75
@@ -508,7 +508,7 @@ RELIABLE_COVERAGE_MINIMUM = .35
 def tracking_config(tracker: "FieldSpaceTracker", relink: Optional[dict] = None) -> dict:
     return {"tracker": tracker.config(), "relink": dict(relink or RELINK_PARAMETERS),
             "reliable_coverage_minimum": RELIABLE_COVERAGE_MINIMUM,
-            "reliability_window": "play_span",
+            "reliability_window": "clip",
             "team": {"official_cluster_fraction": OFFICIAL_CLUSTER_FRACTION,
                      "official_cluster_floor": OFFICIAL_CLUSTER_FLOOR,
                      "confidence_minimum": TEAM_CONFIDENCE_MINIMUM,
@@ -662,13 +662,11 @@ def track_projected_clip(db_path: Path, clip_id: str, projected: Path, output: P
     relink_gates = dict(RELINK_PARAMETERS)
     result, tracklet_links = relink_tracklets(result, gates=relink_gates)
     result, team_diagnostics = resolve_track_teams(result, snap_s)
-    # Durability is judged over the live-action span, not the whole shot: the
-    # pre-snap pan and post-whistle tail are roughly half of a typical clip and
-    # were pushing genuine play-long trajectories below the threshold.
-    if window:
-        span = result[(result.video_timestamp >= window[0]) & (result.video_timestamp <= window[1])]
-    else:
-        span = result
+    # Durability is judged over the whole shot. A play-span denominator was
+    # measured on the frozen protocol and made identity worse (+3.5 switches/100):
+    # it admits marginal tracklets whose fragmentation costs more than the
+    # recovered part-time players gain.
+    span = result
     span_frames = max(1, int(span.video_timestamp.nunique()))
     observations = span.groupby("track_id").size()
     coverage = (observations / span_frames).clip(upper=1)

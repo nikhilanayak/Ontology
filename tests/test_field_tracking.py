@@ -20,8 +20,8 @@ from all22.field_tracking import (
 
 def test_default_tracking_config_hash_is_pinned():
     """Changing any association weight or gate must be a deliberate, recorded decision."""
-    assert config_hash(tracking_config(FieldSpaceTracker())) == "86d90e97cad272ff"
-    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "72d5567fbeebc51e"
+    assert config_hash(tracking_config(FieldSpaceTracker())) == "750a0c25b6ac3e97"
+    assert config_hash(tracking_config(FieldSpaceTracker(use_box_shape=False))) == "e8cca3f7e8d62d8b"
 
 
 def prepared_db(tmp_path: Path) -> tuple[Path, str]:
