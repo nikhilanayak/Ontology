@@ -82,6 +82,71 @@ Selected latest per-source results:
 | `0278` | `0.54915` | `20.85` | `4.05` | `6.8855` |
 | `0295` | `0.41793` | `37.25` | `11.13` | `5.6641` |
 
+## Evaluation now follows the standard MOT paradigm (2026-10-02)
+
+The earlier tuning loop was circular because **the metric was the moving part**. The in-house
+score did per-frame Hungarian matching with a hard 8 yd gate and reported purity, switches/100
+and fragments. Tightening that gate to 2 yd moved purity from `.457` to `.623` on clip `0005`
+with *no change to the tracker*, so sweeps were partly measuring the evaluator. Raw ID-switch
+and fragmentation counts are exactly what the HOTA paper identifies as non-comparable across
+systems with different detection quality.
+
+**Adopted HOTA** (Luiten et al., *HOTA: A Higher Order Metric for Evaluating Multi-Object
+Tracking*, IJCV 2021, [arXiv:2009.07736](https://arxiv.org/abs/2009.07736)) in `src/all22/hota.py`:
+
+* integrates over the localization threshold `alpha` (0.05…0.95), so no single distance gate
+  decides a match;
+* decomposes **exactly** as `HOTA = sqrt(DetA * AssA)`, separating "players we never detected"
+  from "identities we failed to keep" — the two symptoms we kept conflating;
+* reports `DetRe`/`DetPr` and `AssRe`/`AssPr`, which distinguish *splitting* a player across
+  tracklets from *merging* two players into one track;
+* field positions have no boxes, so similarity is the Gaussian from SoccerNet Game State
+  Reconstruction ([arXiv:2404.11335](https://arxiv.org/abs/2404.11335)),
+  `exp(ln(0.05) * d^2 / tau^2)`, scaled so a pair exactly `tau` apart scores `.05` and cannot
+  match at any standard alpha. `tau = 2.5 yd`, chosen from player spacing and frozen.
+
+**Verified bit-exact against the reference implementation** (TrackEval, MIT) on five adversarial
+scenarios covering identity swaps, misses, false positives and jitter: worst absolute difference
+`0.000e+00` across all eight fields. Reference values are pinned in `tests/test_hota.py`.
+
+### HOTA baseline (protocol `7c6f2489…`, r2 detections, 18 sources)
+
+| Split | n | HOTA | DetA | AssA | AssRe | AssPr | LocA |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| validation | 9 | `0.1243` | `0.1215` | `0.1302` | `0.2000` | `0.2325` | `0.7633` |
+| test | 9 | `0.1211` | `0.1208` | `0.1279` | `0.1937` | `0.2397` | `0.7583` |
+| all | 18 | `0.1227` | `0.1211` | `0.1291` | `0.1969` | `0.2361` | `0.7608` |
+
+Validation and test agree closely, so the split is balanced and the aggregate is not an artifact
+of which clips landed where.
+
+### What HOTA revealed that the old metric hid
+
+On clip `0005`, the distance between Hungarian-matched pairs is:
+
+| p10 | p25 | p50 | p75 | p90 | mean |
+|---:|---:|---:|---:|---:|---:|
+| `0.66` | `1.73` | `5.63` | `10.18` | `14.93` | `6.58` yd |
+
+**Only 33% of matched pairs are within 2.5 yd; the median is 5.6 yd.** The previously reported
+"refined error 2.93 yd" was computed over a filtered subset after fitting a correction, so it
+flattered the pipeline. `LocA ≈ 0.76` and low `DetA` are therefore mostly a **localization /
+calibration** problem, not a detector-recall problem: a track that exists but sits 5 yd from the
+player cannot match at most alphas. This reframes the priority — homography and calibration
+quality now look more important than detector recall or association weights.
+
+Note also that a camera shot rarely spans the whole play (clip `0005` covers 68 of 142 BDB
+frames), so HOTA is scored only on covered frames and `frame_overlap` is reported per source;
+charging the tracker for unfilmed truth frames would measure clip boundaries, not tracking.
+
+### Experimental discipline
+
+Protocol sources are now split deterministically into **validation** and **test** by a hash of
+the clip id (9/9 here). Hyperparameters are chosen on validation; test is reported once. The
+earlier sweeps tuned and reported on the same 18 clips, which turns noise into apparent gains —
+one sweep scored `.459` and `.503` for configurations whose difference was within the spread of
+those clips. `purity` and `switches/100` are retained as gate-dependent diagnostics only.
+
 ## Detection/tracking quality investigation (2026-10-02)
 
 Measured on production against the frozen protocol. **Read this before tuning anything.**
@@ -166,16 +231,20 @@ verified bit-identical on 180 real grid points (max abs difference `0.000e+00`).
 
 ## Immediate next work
 
-1. **Fix the identity metric before tuning further.** Bump `EVALUATOR_VERSION`, set
-   `identity_maximum_error_yards` to ~2 yd (or make matching mutual-nearest-neighbour), re-freeze,
-   and re-establish the baseline. Purity differences under the current 8 yd gate are not
-   trustworthy, and parameter sweeps against it overfit: `hc.35`+`aw.3` scored `.459` while
-   `aw.3` alone scored `.503` on the same tracks.
-2. Hold out a validation subset of the 18 sources. Every number above is a median over the same
-   18 clips used for tuning, so the smaller deltas are inside the noise.
-3. Tune embedding association on `0010`/`0007`/`0009` (worst purity at every gate, so genuinely
-   broken rather than mis-measured) without losing good spatial tracks. Each tracker variant has a
-   distinct `config_hash`.
+1. **Attack localization, not association.** `LocA 0.76` and a 5.63 yd median matched-pair
+   distance say the dominant error is where a player is placed on the field, not which track id
+   they carry. Concretely: denser calibration keyframes during live action (currently ~0.75 s
+   apart with linear homography interpolation between them), per-frame homography refinement, and
+   excluding moving players from ORB feature matching. Measure with `LocA` and `DetA` on the
+   validation split.
+2. Re-score the Phase 1–4 changes under HOTA. They were selected against the old gated metric, so
+   which of them actually helped is currently unknown.
+3. Evaluate the detector **directly** (COCO AP/AP50/AP75, and log-average miss rate for crowded
+   formations) on a small set of exhaustively box-labelled held-out frames. Judging detection
+   through a tracking metric cannot separate a detector miss from an association or calibration
+   failure.
+4. Only then revisit association weights, on the validation split, one factor at a time, with
+   paired per-sequence differences rather than aggregate medians.
 2. Improve field-boundary estimation and homography robustness, especially on the three weak example sources above. Note that re-calibrating a clip changes its calibration revision and will (correctly) trip protocol drift; re-freeze deliberately when that is the intent.
 3. Validate changes on additional bounded clips only after the explicit pilot clips improve or reveal a stable tradeoff.
 4. Keep all detection/reconstruction work bounded (`--clip-id` preferred, otherwise a small `--limit`). Do **not** start a full-game or full-season run.

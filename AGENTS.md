@@ -50,6 +50,14 @@ source scripts/production-env.sh
 # .venv/bin/all22 evaluate-audited-sources --game-id bills-at-rams-2022-reg-1 --output data/evaluations/<label>.json
 ```
 
+Evaluation rules:
+
+- **HOTA is the headline metric**, reported as `HOTA`/`DetA`/`AssA`/`AssRe`/`AssPr`/`LocA`. `DetA` is detection quality, `AssA` is identity quality, and `HOTA = sqrt(DetA * AssA)` exactly. Never report a single blended identity number alone; state which component moved.
+- `purity` and `switches/100` are **gate-dependent diagnostics**, not results. They depend on `identity_maximum_error_yards` and are not comparable across tracker changes.
+- Tune on `--split validation` (the default). Report `--split test` **once**, when a change is finished. Never tune against test.
+- `hota_tau_yards` is frozen in the protocol. Changing it, or the alpha grid, requires an `EVALUATOR_VERSION` bump and a re-freeze, and starts a new comparison series.
+- Our HOTA is verified bit-exact against TrackEval (MIT); `tests/test_hota.py` pins reference values. Do not change `src/all22/hota.py` without re-validating against the reference.
+
 Evaluation protocol rules:
 
 - Re-freeze (`all22 freeze-evaluation-protocol --game-id ... [--clip-id ...]`) only when the audited source set, detections, calibration, or evaluator intentionally change. Freezing a new protocol starts a new comparison series; record the protocol path, its `sha256`, `git_commit`, and `git_dirty` in `STATUS.md`.
