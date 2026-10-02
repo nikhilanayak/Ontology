@@ -226,8 +226,9 @@ class FieldSpaceTracker:
     stealing an established identity while still bridging brief detector misses.
     """
 
-    appearance_columns = ("lab_l", "lab_a", "lab_b", "hsv_h", "hsv_s", "hsv_v")
-    appearance_scale = np.asarray([50, 30, 30, 45, 60, 60], dtype=float)
+    embedding_columns = tuple(f"emb_{index:02d}" for index in range(64))
+    appearance_columns = ("lab_l", "lab_a", "lab_b", "hsv_h", "hsv_s", "hsv_v") + embedding_columns
+    appearance_scale = np.asarray([50, 30, 30, 45, 60, 60] + [1.0] * 64, dtype=float)
 
     def __init__(self, maximum_missed: int = 15, maximum_speed_yps: float = 15.0,
                  high_confidence: float = .55, low_confidence: float = .15,
@@ -250,7 +251,7 @@ class FieldSpaceTracker:
         for column_index, column in enumerate(self.appearance_columns):
             if column in detections:
                 values[:, column_index] = pd.to_numeric(detections[column], errors="coerce")
-        defaults = np.asarray([128, 128, 128, 90, 80, 128], dtype=float)
+        defaults = np.asarray([128, 128, 128, 90, 80, 128] + [0.0] * 64, dtype=float)
         return np.where(np.isfinite(values), values, defaults)
 
     def _associate(self, track_indices: list[int], detection_indices: list[int],

@@ -71,10 +71,11 @@ class BoxTracker:
 
 
 class TorchvisionPersonDetector:
-    model_version = "torchvision:fasterrcnn_resnet50_fpn_v2:coco"
+    model_version = "torchvision:fasterrcnn_resnet50_fpn_v2:coco+resnet18:imagenet:embed64"
 
     def __init__(self, device: Optional[str] = None, threshold: float = 0.35):
         import torch
+        from torchvision.models import ResNet18_Weights, resnet18
         from torchvision.models.detection import FasterRCNN_ResNet50_FPN_V2_Weights, fasterrcnn_resnet50_fpn_v2
 
         self.torch = torch
@@ -82,6 +83,13 @@ class TorchvisionPersonDetector:
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
         self.transform = weights.transforms()
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(self.device).eval()
+        appearance_weights = ResNet18_Weights.DEFAULT
+        self.appearance_transform = appearance_weights.transforms()
+        self.appearance_model = resnet18(weights=appearance_weights).to(self.device).eval()
+        self.appearance_model.fc = torch.nn.Identity()
+        generator = np.random.default_rng(20261002)
+        projection = generator.normal(size=(512, 64)).astype(np.float32) / np.sqrt(64)
+        self.appearance_projection = torch.from_numpy(projection).to(self.device)
         self.threshold = threshold
 
     def predict(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -93,6 +101,26 @@ class TorchvisionPersonDetector:
         boxes = result["boxes"][keep].detach().cpu().numpy()
         scores = result["scores"][keep].detach().cpu().numpy()
         return boxes, scores
+
+    def encode(self, frame: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+        crops = []
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        for box in boxes:
+            x1, y1, x2, y2 = box.astype(float)
+            left, right = int(max(0, x1)), int(min(width, x2))
+            top, bottom = int(max(0, y1)), int(min(height, y1 + .8 * (y2 - y1)))
+            crop = rgb[top:bottom, left:right]
+            if not crop.size:
+                crop = np.zeros((32, 16, 3), dtype=np.uint8)
+            crops.append(self.appearance_transform(self.torch.from_numpy(crop).permute(2, 0, 1)))
+        if not crops:
+            return np.empty((0, 64), dtype=np.float32)
+        with self.torch.inference_mode():
+            features = self.appearance_model(self.torch.stack(crops).to(self.device))
+            features = features @ self.appearance_projection
+            features = self.torch.nn.functional.normalize(features, dim=1)
+        return features.detach().cpu().numpy()
 
 
 def _appearance_features(frame: np.ndarray, box: np.ndarray) -> dict:
@@ -183,6 +211,7 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
             if decoded % every == 0:
                 boxes, scores = detector.predict(frame)
                 boxes, scores = _on_field_detections(frame, boxes, scores)
+                embeddings = detector.encode(frame, boxes) if hasattr(detector, "encode") else None
                 for detection_index, (box, score) in enumerate(zip(boxes, scores)):
                     x1, y1, x2, y2 = (float(value) for value in box)
                     records.append({"game_id": source["game_id"], "clip_id": clip_id,
@@ -191,7 +220,10 @@ def detect_clip(db_path: Path, clip_id: str, output: Path, sample_hz: float = 10
                                     "x2": x2, "y2": y2, "contact_x": (x1 + x2) / 2,
                                     "contact_y": y2, "confidence": float(score),
                                     "model_version": detector.model_version,
-                                    **_appearance_features(frame, np.asarray(box))})
+                                    **_appearance_features(frame, np.asarray(box)),
+                                    **({f"emb_{column:02d}": float(value)
+                                        for column, value in enumerate(embeddings[detection_index])}
+                                       if embeddings is not None else {})})
                 sample_index += 1
             decoded += 1
     finally:
