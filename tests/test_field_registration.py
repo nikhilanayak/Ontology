@@ -62,3 +62,34 @@ def test_automatic_registration_does_not_anchor_from_one_jersey_number():
     assert not registration.absolute_x
     assert registration.diagnostics["ocr_numbers_raw"] == 1
     assert registration.diagnostics["ocr_numbers"] == 0
+
+
+def test_verification_accepts_a_plausible_broadcast_homography():
+    from all22.field_registration import verify_registration
+    # 20 px per yard, field origin near the top-left of a 1920x1080 frame.
+    matrix = np.asarray([[1 / 20, 0, 30.0], [0, 1 / 20, 5.0], [0, 0, 1.0]])
+    report = verify_registration(matrix, (1080, 1920, 3))
+    assert report["verified"], report["reasons"]
+    assert 15 < report["pixels_per_yard_x"] < 25
+
+
+def test_verification_rejects_physically_impossible_registrations():
+    """Residuals cannot catch a confident fit placed on the wrong yard lines."""
+    from all22.field_registration import verify_registration
+    shape = (1080, 1920, 3)
+    # Absurd scale: the whole stadium inside one yard.
+    tiny = np.asarray([[1 / 5000, 0, 50.0], [0, 1 / 5000, 25.0], [0, 0, 1.0]])
+    assert not verify_registration(tiny, shape)["verified"]
+    # Absurd scale the other way: a yard covering the frame.
+    huge = np.asarray([[5.0, 0, 0.0], [0, 5.0, 0.0], [0, 0, 1.0]])
+    assert not verify_registration(huge, shape)["verified"]
+    # Projects far off the side of the field.
+    beside = np.asarray([[1 / 20, 0, 0.0], [0, 1 / 20, 900.0], [0, 0, 1.0]])
+    report = verify_registration(beside, shape)
+    assert not report["verified"]
+    assert any("off the side" in reason or "spans" in reason for reason in report["reasons"])
+    # Wildly anisotropic: 1 yd horizontally, 40 yd vertically per pixel.
+    skewed = np.asarray([[1 / 20, 0, 10.0], [0, 1 / 2, 5.0], [0, 0, 1.0]])
+    assert not verify_registration(skewed, shape)["verified"]
+    # Singular.
+    assert not verify_registration(np.zeros((3, 3)), shape)["verified"]

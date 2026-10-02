@@ -45,6 +45,11 @@ EVALUATOR_PARAMETERS: dict = {
     # cannot match at any standard alpha. Chosen from player spacing rather than
     # tuned, and frozen into the protocol.
     "hota_tau_yards": 2.5,
+    # Formation analysis cares about the snap, where players are static and
+    # separated, and about isolated route runners rather than tackle piles.
+    "formation_window_s": .5,
+    "formation_accurate_yards": 1.0,
+    "isolation_yards": 3.0,
 }
 
 
@@ -479,6 +484,78 @@ def hota_for_source(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: flo
     return result
 
 
+def formation_accuracy(tracks: pd.DataFrame, truth: pd.DataFrame, video_snap_s: float,
+                       bdb_snap_frame: int, offset_s: float, flip_x: bool, flip_y: bool,
+                       shift_x: float, correction_matrix: list, parameters: dict) -> dict:
+    """Measure the regime formation analysis actually depends on.
+
+    Whole-play HOTA is dominated by the tackle pile, where inch-level accuracy
+    is neither achievable from one camera nor needed. Formation work needs the
+    snap frame -- players static, separated, unoccluded -- and needs isolated
+    route runners to survive, so both are reported separately here.
+    """
+    window = parameters["formation_window_s"]
+    accurate = parameters["formation_accurate_yards"]
+    isolation = parameters["isolation_yards"]
+    empty = {"snap_players_truth": 0, "snap_players_matched": 0, "snap_recall": 0.0,
+             "snap_median_error_yards": None, "snap_p90_error_yards": None,
+             "snap_within_tolerance": 0.0, "isolated_recall": 0.0,
+             "isolated_median_error_yards": None}
+    if tracks.empty or "track_id" not in tracks or "nfl_id" not in truth:
+        return empty
+    value = tracks.copy()
+    predicted = value[["field_x", "field_y"]].to_numpy(float)
+    if flip_x:
+        predicted[:, 0] = 120.0 - predicted[:, 0]
+    if flip_y:
+        predicted[:, 1] = 160.0 / 3.0 - predicted[:, 1]
+    predicted[:, 0] += shift_x
+    correction = np.asarray(correction_matrix, dtype=float)
+    predicted = cv2.perspectiveTransform(
+        predicted.astype(np.float32).reshape(-1, 1, 2), correction).reshape(-1, 2)
+    value[["aligned_x", "aligned_y"]] = predicted
+    answers = {int(frame_id): group for frame_id, group in truth.groupby("frame_id")}
+    snap_errors: list[float] = []
+    snap_truth = snap_matched = 0
+    isolated_errors: list[float] = []
+    isolated_truth = isolated_matched = 0
+    for timestamp, group in value.groupby("video_timestamp", sort=True):
+        frame_id = bdb_snap_frame + round((float(timestamp) - video_snap_s + offset_s) * 10)
+        actual = answers.get(frame_id)
+        if actual is None or actual.empty:
+            continue
+        truth_points = actual[["x", "y"]].to_numpy(float)
+        track_points = group[["aligned_x", "aligned_y"]].to_numpy(float)
+        distances = np.linalg.norm(truth_points[:, None, :] - track_points[None, :, :], axis=2)
+        rows, columns = linear_sum_assignment(distances)
+        paired = {int(row): float(distances[row, column]) for row, column in zip(rows, columns)}
+        at_snap = abs(frame_id - bdb_snap_frame) <= round(window * 10)
+        spacing = np.linalg.norm(truth_points[:, None, :] - truth_points[None, :, :], axis=2)
+        np.fill_diagonal(spacing, np.inf)
+        nearest_neighbour = spacing.min(axis=1)
+        for index in range(len(truth_points)):
+            error = paired.get(index)
+            if at_snap:
+                snap_truth += 1
+                if error is not None:
+                    snap_matched += 1
+                    snap_errors.append(error)
+            if nearest_neighbour[index] >= isolation:
+                isolated_truth += 1
+                if error is not None:
+                    isolated_matched += 1
+                    isolated_errors.append(error)
+    return {
+        "snap_players_truth": snap_truth, "snap_players_matched": snap_matched,
+        "snap_recall": snap_matched / max(snap_truth, 1),
+        "snap_median_error_yards": float(np.median(snap_errors)) if snap_errors else None,
+        "snap_p90_error_yards": float(np.percentile(snap_errors, 90)) if snap_errors else None,
+        "snap_within_tolerance": float(np.mean(np.asarray(snap_errors) <= accurate)) if snap_errors else 0.0,
+        "isolated_recall": isolated_matched / max(isolated_truth, 1),
+        "isolated_median_error_yards": float(np.median(isolated_errors)) if isolated_errors else None,
+    }
+
+
 def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: int,
                      snap_s: float, dead_s: float,
                      parameters: Optional[dict] = None) -> tuple[Optional[dict], Optional[str]]:
@@ -540,6 +617,9 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
     hota = hota_for_source(
         identity_window, truth, snap_s, bdb_snap, offset, flip_x, flip_y, shift_x,
         bdb_refinement["correction_matrix"], parameters["hota_tau_yards"])
+    formation = formation_accuracy(
+        identity_window, truth, snap_s, bdb_snap, offset, flip_x, flip_y, shift_x,
+        bdb_refinement["correction_matrix"], parameters)
     return {
         "window": {"snap_s": snap_s, "dead_s": dead_s},
         "spatial_track_rows": int(len(window)), "identity_track_rows": int(len(identity_window)),
@@ -550,6 +630,7 @@ def _evaluate_source(all_tracks: pd.DataFrame, truth: pd.DataFrame, bdb_snap: in
         "median_error_yards": median, "p90_error_yards": float(np.percentile(errors, 90)),
         "bdb_refinement": bdb_refinement,
         "hota": hota,
+        "formation": formation,
         # Retained as diagnostics only. These depend on a single hard distance
         # gate, which made them unusable for comparing tracker changes.
         "identity_metrics": identities,
@@ -568,6 +649,11 @@ def _tracks_provenance(connection, clip_id: str, path: Path) -> dict:
             "artifact_matched": artifact is not None}
 
 
+def _median_optional(values: list) -> Optional[float]:
+    usable = [value for value in values if value is not None]
+    return float(np.median(usable)) if usable else None
+
+
 def _summarize(game_id: str, results: list[dict], skipped: list[dict], provenance: dict,
                split: Optional[str] = None) -> dict:
     if not results:
@@ -581,6 +667,14 @@ def _summarize(game_id: str, results: list[dict], skipped: list[dict], provenanc
         "hota": hota["HOTA"], "det_a": hota["DetA"], "ass_a": hota["AssA"],
         "det_re": hota["DetRe"], "det_pr": hota["DetPr"],
         "ass_re": hota["AssRe"], "ass_pr": hota["AssPr"], "loc_a": hota["LocA"],
+        "snap_median_error_yards": _median_optional([
+            row["formation"]["snap_median_error_yards"] for row in results]),
+        "snap_within_1_yard": float(np.median([
+            row["formation"]["snap_within_tolerance"] for row in results])),
+        "snap_recall": float(np.median([row["formation"]["snap_recall"] for row in results])),
+        "isolated_recall": float(np.median([row["formation"]["isolated_recall"] for row in results])),
+        "isolated_median_error_yards": _median_optional([
+            row["formation"]["isolated_median_error_yards"] for row in results]),
         "median_source_error_yards": float(np.median([row["median_error_yards"] for row in results])),
         "median_source_coverage": float(np.median([row["player_coverage"] for row in results])),
         "median_refined_held_out_error_yards": float(np.median([

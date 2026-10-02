@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from all22.db import connect, initialize, transaction
 from all22.field_tracking import (
@@ -269,3 +270,80 @@ def test_global_association_respects_reachable_distance_and_team():
     # b is 75 yd away (unreachable in 0.6 s) and d is the other team.
     assert diagnostics["links"] == 0
     assert result.track_id.nunique() == 3
+
+
+def test_sideline_players_survive_projection(tmp_path: Path):
+    """Split receivers and gunners stand on or just past the sideline."""
+    database, clip_id = prepared_db(tmp_path)
+    identity = {"image_points": [[0, 0], [120, 0], [0, 53.333], [120, 53.333]],
+                "field_points": [[0, 0], [120, 0], [0, 53.333], [120, 53.333]]}
+    save_calibration_keyframes(database, clip_id, {
+        "keyframes": [{"timestamp_s": 1.0, **identity}, {"timestamp_s": 2.0, **identity}]})
+    rows = []
+    for frame_id, timestamp in enumerate((1.0, 1.5, 2.0)):
+        rows.extend([
+            {"clip_id": clip_id, "frame_id": frame_id, "video_timestamp": timestamp,
+             "contact_x": 60.0, "contact_y": 26.0},            # midfield
+            {"clip_id": clip_id, "frame_id": frame_id, "video_timestamp": timestamp,
+             "contact_x": 60.0, "contact_y": -1.5},            # just outside a sideline
+            {"clip_id": clip_id, "frame_id": frame_id, "video_timestamp": timestamp,
+             "contact_x": 60.0, "contact_y": 55.0},            # just past the far sideline
+            {"clip_id": clip_id, "frame_id": frame_id, "video_timestamp": timestamp,
+             "contact_x": 60.0, "contact_y": -40.0},           # genuinely off field: a bench
+        ])
+    detections = tmp_path / "detections.parquet"
+    pd.DataFrame(rows).to_parquet(detections)
+    projected = tmp_path / "projected.parquet"
+    project_clip(database, clip_id, detections, projected)
+    frame = pd.read_parquet(projected)
+    kept = frame[frame.on_field]
+    assert set(kept.field_y.round(1)) == {26.0, -1.5, 55.0}, "sideline players must survive"
+    assert (frame[~frame.on_field].field_y == -40.0).all(), "the bench must still be excluded"
+    # How far outside is recorded so later stages can weigh it.
+    assert frame.out_of_bounds_yards.max() == pytest.approx(40.0)
+    assert frame.loc[frame.field_y == 26.0, "out_of_bounds_yards"].iloc[0] == 0.0
+
+
+def test_team_resolution_is_generic_and_not_colour_dependent():
+    """Sides come from formation geometry, so any uniform pairing works."""
+    def build(colour_a, colour_b):
+        rows = []
+        for index in range(22):
+            left = index < 11
+            colour = colour_a if left else colour_b
+            for step in range(3):
+                rows.append({"track_id": f"t{index}", "video_timestamp": 10.0 + .1 * step,
+                             "field_x": (48.0 if left else 52.0) + .05 * index, "field_y": 20.0,
+                             "team": "team_0", "person_role": "player",
+                             "lab_l": colour[0], "lab_a": colour[1], "lab_b": colour[2],
+                             "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+        return pd.DataFrame(rows)
+
+    # Three unrelated matchups, including two visually similar light uniforms.
+    for colour_a, colour_b in (((200, 10, 10), (40, 200, 200)),
+                               ((90, 150, 60), (95, 60, 150)),
+                               ((210, 128, 128), (205, 130, 126))):
+        resolved, diagnostics = resolve_track_teams(build(colour_a, colour_b), 10.0)
+        assert diagnostics["method"] == "snap_line_of_scrimmage"
+        counts = resolved[resolved.person_role == "player"].groupby("team").track_id.nunique()
+        assert counts.to_dict() == {"team_0": 11, "team_1": 11}, (colour_a, colour_b)
+
+
+def test_team_resolution_propagates_to_players_absent_at_the_snap():
+    rows = []
+    for index in range(22):
+        left = index < 11
+        for step in range(3):
+            rows.append({"track_id": f"t{index}", "video_timestamp": 10.0 + .1 * step,
+                         "field_x": (48.0 if left else 52.0) + .05 * index, "field_y": 20.0,
+                         "team": "team_0", "person_role": "player",
+                         "lab_l": 200 if left else 40, "lab_a": 10 if left else 200,
+                         "lab_b": 10 if left else 200, "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    # A player the snap frame never saw, wearing the left side's uniform.
+    for step in range(3):
+        rows.append({"track_id": "late", "video_timestamp": 11.0 + .1 * step,
+                     "field_x": 70.0, "field_y": 30.0, "team": "unknown", "person_role": "player",
+                     "lab_l": 200, "lab_a": 10, "lab_b": 10, "hsv_h": 90, "hsv_s": 80, "hsv_v": 128})
+    resolved, diagnostics = resolve_track_teams(pd.DataFrame(rows), 10.0)
+    assert diagnostics["appearance_propagated"] >= 1
+    assert resolved[resolved.track_id == "late"].team.iloc[0] == "team_0"

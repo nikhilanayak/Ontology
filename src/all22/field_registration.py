@@ -8,7 +8,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .geometry import FIELD_WIDTH, estimate_homography, project_points
+from .geometry import FIELD_LENGTH, FIELD_WIDTH, estimate_homography, project_points
 
 
 @dataclass(frozen=True)
@@ -276,6 +276,74 @@ def _number_anchored_homography(lines: list[np.ndarray], field_x: np.ndarray,
     }
 
 
+# A homography can fit the lines it was handed almost perfectly and still place
+# them on the wrong part of the field: yard lines repeat every 5 yd and the
+# painted numbers are the only absolute cue. On the pilot, calibration's own
+# residuals were uncorrelated with real error (|r| < 0.17 over 15 clips), and
+# one clip reported a 0.22 yd p95 while sitting 5.92 yd out. These checks test
+# the *result* against independent facts about a football field instead.
+PLAUSIBLE_PIXELS_PER_YARD = (2.0, 60.0)
+MAXIMUM_SKEW_RATIO = 4.0
+
+
+def verify_registration(matrix: np.ndarray, frame_shape: tuple[int, ...]) -> dict:
+    """Check a homography against known field geometry, independently of its fit.
+
+    Returns the reasons it is implausible; an empty list means it survived.
+    """
+    reasons: list[str] = []
+    height, width = frame_shape[:2]
+    try:
+        inverse = np.linalg.inv(matrix)
+    except np.linalg.LinAlgError:
+        return {"reasons": ["matrix is singular"], "verified": False}
+    # Where does the visible frame land on the field?
+    corners = np.asarray([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    field = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    if not np.isfinite(field).all():
+        return {"reasons": ["projection is not finite"], "verified": False}
+    span_x = float(field[:, 0].max() - field[:, 0].min())
+    span_y = float(field[:, 1].max() - field[:, 1].min())
+    # A broadcast shot covers a plausible slice of a 120 x 53.3 yd field.
+    if not 5.0 <= span_x <= 400.0:
+        reasons.append(f"frame spans {span_x:.0f} yd along the field")
+    if not 3.0 <= span_y <= 300.0:
+        reasons.append(f"frame spans {span_y:.0f} yd across the field")
+    # The shot must actually overlap the field rather than sitting beside it.
+    if field[:, 0].max() < -20 or field[:, 0].min() > FIELD_LENGTH + 20:
+        reasons.append("frame projects entirely off the end of the field")
+    if field[:, 1].max() < -20 or field[:, 1].min() > FIELD_WIDTH + 20:
+        reasons.append("frame projects entirely off the side of the field")
+    # Scale sanity: a yard must occupy a believable number of pixels at the
+    # image centre, and must not be wildly anisotropic.
+    centre = np.asarray([[width / 2, height / 2]], dtype=np.float32)
+    probes = np.asarray([[width / 2 + 1, height / 2], [width / 2, height / 2 + 1]], dtype=np.float32)
+    mapped = cv2.perspectiveTransform(
+        np.vstack([centre, probes]).reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    step_x = float(np.linalg.norm(mapped[1] - mapped[0]))
+    step_y = float(np.linalg.norm(mapped[2] - mapped[0]))
+    for name, step in (("horizontal", step_x), ("vertical", step_y)):
+        if step <= 0 or not np.isfinite(step):
+            reasons.append(f"{name} scale is degenerate")
+            continue
+        pixels_per_yard = 1.0 / step
+        low, high = PLAUSIBLE_PIXELS_PER_YARD
+        if not low <= pixels_per_yard <= high:
+            reasons.append(f"{name} scale is {pixels_per_yard:.1f} px/yd")
+    if step_x > 0 and step_y > 0:
+        ratio = max(step_x, step_y) / min(step_x, step_y)
+        if ratio > MAXIMUM_SKEW_RATIO:
+            reasons.append(f"anisotropic scale ratio {ratio:.1f}")
+    # Orientation must be preserved: a mirrored field means the solution flipped.
+    determinant = float(np.linalg.det(matrix[:2, :2]))
+    if determinant == 0 or not np.isfinite(determinant):
+        reasons.append("degenerate linear part")
+    return {"reasons": reasons, "verified": not reasons,
+            "frame_span_x_yards": span_x, "frame_span_y_yards": span_y,
+            "pixels_per_yard_x": float(1.0 / step_x) if step_x > 0 else None,
+            "pixels_per_yard_y": float(1.0 / step_y) if step_y > 0 else None}
+
+
 def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNumber]] = None) -> Registration:
     lines, mask, white = detect_yard_lines(frame)
     raw_recognized = numbers if numbers is not None else read_field_numbers(frame, reader)
@@ -308,8 +376,13 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
     # consensus rather than allowing one rejected endpoint to poison the fit.
     geometric_ok = (calibration.inlier_ratio >= .65 and calibration.median_error_yards <= 1.5
                     and calibration.inlier_p95_error_yards <= 2.0)
+    # Residuals only say the fit explains the lines it was given; they cannot
+    # detect a confident fit placed on the wrong yard lines. Verify the result.
+    verification = verify_registration(calibration.matrix, frame.shape)
     confidence = float(np.clip(.25 + .08 * min(len(lines), 6) + .2 * absolute
                                - .2 * min(spacing_cv, 1), 0, 1)) if geometric_ok else 0.0
+    if not verification["verified"]:
+        confidence = 0.0
     diagnostics = {"line_count": len(lines), "ocr_numbers": len(recognized),
                    "ocr_numbers_raw": len(raw_recognized),
                    "ocr_assignment_error": ocr_error, "spacing_cv": spacing_cv,
@@ -320,6 +393,8 @@ def register_field(frame: np.ndarray, reader=None, numbers: Optional[list[OCRNum
                    "p95_error_yards": calibration.p95_error_yards,
                    "inlier_p95_error_yards": calibration.inlier_p95_error_yards}
     diagnostics.update(semantic_diagnostics)
+    diagnostics["verification"] = verification
+    diagnostics["verified"] = verification["verified"]
     return Registration(image_points, field_points, calibration.matrix, confidence, absolute, diagnostics)
 
 

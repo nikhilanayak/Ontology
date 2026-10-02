@@ -112,7 +112,20 @@ def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) ->
         value["field_y"] = points[:, 1]
         value["calibration_valid"] = bool(valid)
         value["calibration_p95_yards"] = p95
-        value["on_field"] = (value.field_x.between(0, FIELD_LENGTH) & value.field_y.between(0, FIELD_WIDTH))
+        # Players legitimately stand just outside the painted field: split
+        # receivers and gunners line up on or beyond the numbers, and the
+        # sideline itself is a yard wide. A hard boundary discarded them -- on
+        # one pilot clip 98% of dropped detections failed only on field_y, with
+        # a median of 2.2 yd outside the sideline -- which removed exactly the
+        # wide route runners we most want to follow. Admit a margin scaled by
+        # how well this frame is calibrated, and record how far outside each
+        # detection sits so later stages can judge it.
+        margin = min(MAXIMUM_OUT_OF_BOUNDS_YARDS, max(OUT_OF_BOUNDS_MARGIN_YARDS, p95))
+        value["out_of_bounds_yards"] = np.maximum(
+            np.maximum(-value.field_x, value.field_x - FIELD_LENGTH),
+            np.maximum(-value.field_y, value.field_y - FIELD_WIDTH)).clip(lower=0)
+        value["on_field"] = (value.field_x.between(-margin, FIELD_LENGTH + margin)
+                             & value.field_y.between(-margin, FIELD_WIDTH + margin))
         projected_parts.append(value)
     result = pd.concat(projected_parts, ignore_index=True)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +143,11 @@ def project_clip(db_path: Path, clip_id: str, detections: Path, output: Path) ->
     return {"rows": len(result), "valid_fraction": float(result.calibration_valid.mean()),
             "on_field_fraction": float(result.on_field.mean())}
 
+
+# How far outside the painted field a detection may sit and still be tracked.
+# Scaled by the frame's calibration p95 so a well-registered shot stays tight.
+OUT_OF_BOUNDS_MARGIN_YARDS = 3.0
+MAXIMUM_OUT_OF_BOUNDS_YARDS = 8.0
 
 OFFICIAL_CLUSTER_FRACTION = .18
 OFFICIAL_CLUSTER_FLOOR = 2
@@ -242,13 +260,25 @@ def assign_team_probabilities(frame: pd.DataFrame, anchor_timestamp: Optional[fl
     return result
 
 
-def resolve_track_teams(frame: pd.DataFrame, snap_timestamp: Optional[float]) -> tuple[pd.DataFrame, dict]:
-    """Assign one team per track, preferring snap geometry over per-detection colour.
+def _track_appearance(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """One appearance vector per track, robust to a few bad crops."""
+    if not columns:
+        return pd.DataFrame(index=frame.track_id.unique())
+    return frame.groupby("track_id")[columns].median()
 
-    A track is one player and therefore one team, so the label is decided once
-    per track instead of per detection. When the snap formation separates
-    cleanly across the line of scrimmage, that split supervises the naming; the
-    colour clusters only carry it to tracks that are absent at the snap.
+
+def resolve_track_teams(frame: pd.DataFrame, snap_timestamp: Optional[float]) -> tuple[pd.DataFrame, dict]:
+    """Assign one team per track, deciding sides by geometry and spreading them by appearance.
+
+    Jersey colour is a poor primary signal: it depends on the two teams playing,
+    the stadium lighting, shadow across the field, and white-balance, so any
+    clustering tuned on one matchup transfers badly. Formation geometry does
+    not: at the snap the two units occupy disjoint ranges of ``field_x``, which
+    separates them perfectly in BDB truth regardless of who is playing.
+
+    So the line of scrimmage *defines* the two sides, and appearance is learned
+    per clip from those sides to label players who are absent or hidden at the
+    snap. Nothing here is specific to a team, a colour, or a competition.
     """
     result = frame.copy()
     diagnostics: dict = {"method": "colour_vote"}
@@ -260,35 +290,63 @@ def resolve_track_teams(frame: pd.DataFrame, snap_timestamp: Optional[float]) ->
     players = result[~result.track_id.isin(official_tracks)]
     votes = (players[players.team.str.startswith("team_")]
              .groupby(["track_id", "team"]).size().unstack(fill_value=0))
-    colour_team = votes.idxmax(axis=1) if len(votes) else pd.Series(dtype=str)
-    assignment = dict(colour_team)
-    if snap_timestamp is not None and len(players):
-        distance = (players.video_timestamp - float(snap_timestamp)).abs()
-        snap_rows = players[distance <= float(distance.min()) + .02]
-        snap_rows = snap_rows.groupby("track_id")[["field_x"]].median().reset_index()
-        split = snap_team_split(snap_rows)
-        if split:
-            left = set(snap_rows.loc[snap_rows.field_x < split["threshold"], "track_id"])
-            right = set(snap_rows.loc[snap_rows.field_x > split["threshold"], "track_id"])
-            # Name the sides so they agree with the dominant colour vote, keeping
-            # team_0/team_1 consistent with the appearance clusters.
-            def side_name(side: set, fallback: str) -> str:
-                names = [assignment[track] for track in side if track in assignment]
-                return pd.Series(names).mode().iloc[0] if names else fallback
-            left_name = side_name(left, "team_0")
-            right_name = side_name(right, "team_1")
-            if left_name == right_name:
-                right_name = "team_1" if left_name == "team_0" else "team_0"
-            for track in left:
-                assignment[track] = left_name
-            for track in right:
-                assignment[track] = right_name
-            diagnostics = {"method": "snap_line_of_scrimmage", "threshold_x": split["threshold"],
-                           "gap_yards": split["gap_yards"], "left": split["left"], "right": split["right"],
-                           "snap_tracks": int(len(snap_rows))}
+    assignment = dict(votes.idxmax(axis=1)) if len(votes) else {}
+    if snap_timestamp is None or players.empty:
+        return _apply_team_assignment(result, assignment, official_tracks, diagnostics)
+    distance = (players.video_timestamp - float(snap_timestamp)).abs()
+    snap_rows = players[distance <= float(distance.min()) + .02]
+    snap_positions = snap_rows.groupby("track_id")[["field_x"]].median().reset_index()
+    split = snap_team_split(snap_positions)
+    if not split:
+        return _apply_team_assignment(result, assignment, official_tracks, diagnostics)
+    left = set(snap_positions.loc[snap_positions.field_x < split["threshold"], "track_id"])
+    right = set(snap_positions.loc[snap_positions.field_x > split["threshold"], "track_id"])
+    for track in left:
+        assignment[track] = "team_0"
+    for track in right:
+        assignment[track] = "team_1"
+    diagnostics = {"method": "snap_line_of_scrimmage", "threshold_x": split["threshold"],
+                   "gap_yards": split["gap_yards"], "left": split["left"], "right": split["right"],
+                   "snap_tracks": int(len(snap_positions))}
+    # Learn this clip's two uniforms from the players the geometry just labelled,
+    # then label whoever the snap could not see. The model is fitted per clip, so
+    # it carries no assumption about which colours the teams wear.
+    columns = [column for column in FieldSpaceTracker.appearance_columns if column in players]
+    appearance = _track_appearance(players, columns)
+    scale_lookup = dict(zip(FieldSpaceTracker.appearance_columns, FieldSpaceTracker.appearance_scale))
+    scale = np.asarray([scale_lookup[column] for column in columns]) if columns else np.zeros(0)
+    unlabelled = [track for track in appearance.index if track not in assignment]
+    if len(scale) and unlabelled:
+        centroids = {}
+        for name, members in (("team_0", left), ("team_1", right)):
+            known = appearance.loc[[track for track in members if track in appearance.index]]
+            if len(known):
+                centroids[name] = known.to_numpy(float).mean(axis=0)
+        if len(centroids) == 2:
+            propagated = 0
+            for track in unlabelled:
+                vector = appearance.loc[track].to_numpy(float)
+                if not np.isfinite(vector).all():
+                    continue
+                distances = {name: float(np.linalg.norm((vector - centre) / scale))
+                             for name, centre in centroids.items()}
+                nearest = min(distances, key=distances.get)
+                other = max(distances, key=distances.get)
+                # Only accept a clear winner; an ambiguous uniform stays unknown
+                # rather than inventing a side.
+                if distances[other] > 0 and distances[nearest] / distances[other] <= .8:
+                    assignment[track] = nearest
+                    propagated += 1
+            diagnostics["appearance_propagated"] = propagated
+    return _apply_team_assignment(result, assignment, official_tracks, diagnostics)
+
+
+def _apply_team_assignment(result: pd.DataFrame, assignment: dict, official_tracks: set,
+                           diagnostics: dict) -> tuple[pd.DataFrame, dict]:
     for track in official_tracks:
         assignment[track] = "official"
     resolved = result.track_id.map(assignment).fillna("unknown")
+    result = result.copy()
     result["team"] = resolved
     result["person_role"] = np.where(resolved == "official", "official",
                                      np.where(resolved.str.startswith("team_"), "player", "unknown"))
