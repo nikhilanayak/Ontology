@@ -351,6 +351,69 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
             frame = frame[frame.frame_id.astype(int) % stride == 0]
         return frame.where(pd.notnull(frame), None).to_dict(orient="records")
 
+    @app.get("/api/clips/{clip_id}/field-detections")
+    def field_detections(clip_id: str, timestamp_s: Optional[float] = None):
+        """Expose raw yard-line and painted-number detections for one frame.
+
+        Calibration can fit the lines it was handed almost perfectly and still
+        place them on the wrong yard lines, so this reports what the detector
+        actually saw -- every line, every OCR number with its confidence, and
+        the yard value each line was assigned -- rather than only the result.
+        """
+        with connect(db_path) as connection:
+            clip = connection.execute(
+                """SELECT c.start_s,c.end_s,c.angle,g.video_path FROM clips c
+                   JOIN games g ON g.game_id=c.game_id WHERE c.clip_id=?""", (clip_id,),
+            ).fetchone()
+        if not clip:
+            raise HTTPException(404, "Source clip not found")
+        video_path = Path(clip["video_path"] or "")
+        if not video_path.exists():
+            raise HTTPException(404, "Video file missing")
+        start, end = float(clip["start_s"]), float(clip["end_s"])
+        when = start + min(.2, (end - start) * .05) if timestamp_s is None else float(timestamp_s)
+        if not start <= when <= end:
+            raise HTTPException(422, f"Timestamp must lie inside the shot ({start:.2f}-{end:.2f}s)")
+        try:
+            payload = field_registration.describe_field_detections(video_path, when)
+        except (ValueError, RuntimeError) as error:
+            raise HTTPException(422, str(error)) from error
+        return {"clip_id": clip_id, "angle": clip["angle"], "start_s": start, "end_s": end,
+                "timestamp_s": when, **payload}
+
+    @app.get("/api/clips/{clip_id}/frame.jpg")
+    def clip_frame(clip_id: str, timestamp_s: Optional[float] = None):
+        """Return a single decoded frame so detections can be drawn over it."""
+        import cv2
+        from fastapi.responses import Response
+
+        with connect(db_path) as connection:
+            clip = connection.execute(
+                """SELECT c.start_s,c.end_s,g.video_path FROM clips c
+                   JOIN games g ON g.game_id=c.game_id WHERE c.clip_id=?""", (clip_id,),
+            ).fetchone()
+        if not clip:
+            raise HTTPException(404, "Source clip not found")
+        path = Path(clip["video_path"] or "")
+        if not path.exists():
+            raise HTTPException(404, "Video file missing")
+        start, end = float(clip["start_s"]), float(clip["end_s"])
+        when = start + min(.2, (end - start) * .05) if timestamp_s is None else float(timestamp_s)
+        capture = cv2.VideoCapture(str(path))
+        if not capture.isOpened():
+            raise HTTPException(422, "Could not open the film")
+        try:
+            capture.set(cv2.CAP_PROP_POS_MSEC, when * 1000)
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        if not ok:
+            raise HTTPException(422, f"Could not decode a frame at {when:.2f}s")
+        encoded, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        if not encoded:
+            raise HTTPException(500, "Could not encode the frame")
+        return Response(content=buffer.tobytes(), media_type="image/jpeg")
+
     @app.get("/api/video/{game_id}")
     def video(game_id: str):
         with connect(db_path) as connection:

@@ -1,4 +1,4 @@
-const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[]};
+const state = {game:null, play:null, shot:null, shotActions:[], tracks:[], frames:[], frame:0, timer:null, activeSource:null, calibrationCurrent:null, calibrationKeyframes:[], fieldDebug:null};
 const $ = id => document.getElementById(id);
 async function json(url, options) { const r=await fetch(url,options); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
@@ -79,6 +79,7 @@ async function selectShot(shot,button){
   document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button?.classList.add('active');state.shot=shot;state.play=null;state.activeSource=null;state.tracks=[];
   $('play-title').textContent=`${shot.angle} shot`;$('play-detail').textContent=`${shot.clip_id} · ${Number(shot.end_s-shot.start_s).toFixed(1)} seconds`;$('film').src=`/api/video/${state.game}`;
   $('audit').hidden=true;$('timing').hidden=true;$('calibration').hidden=false;$('calibration-status').textContent='';state.calibrationCurrent=null;
+  $('field-debug').hidden=false;$('debug-status').textContent='';$('debug-time').value=Number(shot.start_s).toFixed(2);state.fieldDebug=null;drawFieldDebug();
   const savedCalibration=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/calibration`);state.calibrationKeyframes=savedCalibration.keyframes.map(k=>k.annotations?.length?{timestamp_s:k.timestamp_s,annotations:k.annotations}:{timestamp_s:k.timestamp_s,image_points:k.image_points,field_points:k.field_points});updateCalibrationText();
   const actions=await json(`/api/clips/${encodeURIComponent(shot.clip_id)}/actions`);state.shotActions=actions;$('sources').innerHTML='';
   for(const action of actions){const b=document.createElement('button');b.textContent=`Action ${action.action_order} · ${Number(action.snap_s).toFixed(1)}–${Number(action.dead_s).toFixed(1)}s · ${action.status}`;b.onclick=()=>seekSource({start_s:action.formation_start_s,end_s:action.playback_end_s,snap_s:action.snap_s,play_end_s:action.dead_s},b);$('sources').appendChild(b);}
@@ -102,7 +103,7 @@ function seekSource(source,button){
 }
 function loadTimingSource(){const sources=state.play?.sources||[],source=sources[Number($('timing-source').value)||0];if(!source)return;$('timing-snap').value=source.snap_s??source.start_s;$('timing-end').value=source.play_end_s??source.end_s;}
 async function selectPlay(p,button){
-  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('action-review').hidden=true;$('overlay').classList.remove('calibrating');
+  document.querySelectorAll('.play').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.shot=null;state.play=p;state.tracks=[];state.activeSource=null;$('calibration').hidden=true;$('action-review').hidden=true;$('field-debug').hidden=true;$('overlay').classList.remove('calibrating');
   $('play-title').textContent=`Q${p.quarter??'?'} ${p.clock??''} — ${p.possession??''}`;$('play-detail').textContent=p.description;$('diagnostics').textContent=JSON.stringify({status:p.processing_status,reasons:p.reasons,metrics:p.metrics},null,2);$('film').src=`/api/video/${state.game}`;
   const sources=p.sources||[];$('sources').innerHTML='';let firstButton=null;
   for(const [i,source] of sources.entries()){const b=document.createElement('button');if(!firstButton)firstButton=b;b.textContent=`Source ${i+1} · ${source.angle} · ${(sourceEnd(source)-sourceStart(source)).toFixed(1)}s action`;b.onclick=()=>seekSource(source,b);$('sources').appendChild(b);}
@@ -134,3 +135,77 @@ $('games').onchange=loadWorkspace;$('workspace-mode').onchange=loadWorkspace;
 $('timeline').oninput=e=>{state.frame=Number(e.target.value);if(state.shot&&state.frames[state.frame]!=null)$('film').currentTime=state.frames[state.frame];draw();};
 $('play-animation').onclick=()=>{if(state.timer){clearInterval(state.timer);state.timer=null;return;}state.timer=setInterval(()=>{state.frame++;if(state.frame>=state.frames.length){clearInterval(state.timer);state.timer=null;return;}$('timeline').value=state.frame;draw();},100);};
 field();loadGames().catch(e=>$('status').textContent=e.message);
+
+
+// --- Field detection debug -------------------------------------------------
+// Yard lines repeat every five yards, so a registration can fit its lines
+// perfectly and still sit on the wrong ones. This view shows the raw evidence
+// behind that choice: each detected line with the yard value it was given, and
+// each painted number with its OCR confidence and the two field positions it
+// could legally mean.
+function drawFieldDebug(){
+  const canvas=$('debug-overlay'),image=$('debug-image'),data=state.fieldDebug;
+  if(!data||!image.naturalWidth){canvas.width=canvas.height=0;return;}
+  canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;
+  canvas.style.width=`${image.clientWidth}px`;canvas.style.height=`${image.clientHeight}px`;
+  const x=canvas.getContext('2d');x.clearRect(0,0,canvas.width,canvas.height);
+  x.lineWidth=Math.max(2,canvas.width/700);x.font=`${Math.max(16,canvas.width/70)}px system-ui`;
+  for(const line of data.lines){
+    const [a,b]=line.image_points;
+    x.strokeStyle=line.assigned_field_x==null?'rgba(255,120,120,.95)':'rgba(90,200,255,.95)';
+    x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();
+    const label=line.assigned_field_x==null?`#${line.index} unassigned`:`#${line.index} x=${line.assigned_field_x.toFixed(0)}`;
+    const top=a[1]<b[1]?a:b;
+    x.fillStyle='rgba(0,0,0,.65)';const w=x.measureText(label).width+10;
+    x.fillRect(top[0]-w/2,top[1]+4,w,26);
+    x.fillStyle='#bfe9ff';x.fillText(label,top[0]-w/2+5,top[1]+24);
+  }
+  for(const number of data.numbers){
+    const [cx,cy]=number.center;
+    x.strokeStyle=number.trusted?'rgba(130,255,150,.95)':'rgba(255,190,80,.95)';
+    x.beginPath();x.arc(cx,cy,Math.max(10,canvas.width/90),0,Math.PI*2);x.stroke();
+    const label=`${number.value} (${number.confidence.toFixed(2)})`;
+    x.fillStyle='rgba(0,0,0,.65)';const w=x.measureText(label).width+10;
+    x.fillRect(cx+12,cy-14,w,26);
+    x.fillStyle=number.trusted?'#b7ffc4':'#ffd79a';x.fillText(label,cx+17,cy+6);
+  }
+}
+function renderFieldDebug(){
+  const data=state.fieldDebug;if(!data)return;
+  const verification=data.verification||{};
+  const reasons=(verification.reasons||[]);
+  const summary=[
+    `<span class="${data.numbers_credible?'ok':'warn'}">numbers ${data.numbers_credible?'credible':'not credible'}</span>`,
+    `<span class="${data.absolute_x?'ok':'warn'}">absolute x ${data.absolute_x?'resolved':'unresolved'}</span>`,
+    `<span>${data.lines.length} lines · ${data.numbers.length} numbers</span>`,
+    `<span>OCR assignment error ${data.ocr_assignment_error==null?'n/a':data.ocr_assignment_error.toFixed(2)}</span>`,
+    `<span>confidence ${data.registration?.confidence==null?'n/a':Number(data.registration.confidence).toFixed(2)}</span>`,
+    `<span class="${reasons.length?'warn':'ok'}">verification ${reasons.length?reasons.join('; '):'passed'}</span>`,
+    data.ocr_unavailable?`<span class="warn">OCR unavailable: ${data.ocr_unavailable}</span>`:'',
+  ].join('');
+  $('debug-summary').innerHTML=summary;
+  const rows=[`<tr><th>Kind</th><th>Detail</th><th>Confidence</th><th>Assigned / candidates</th><th>Nearest line</th></tr>`];
+  for(const line of data.lines)
+    rows.push(`<tr><td>line</td><td>#${line.index}</td><td>—</td><td>${line.assigned_field_x==null?'<em>none</em>':`x = ${line.assigned_field_x.toFixed(1)} yd`}</td><td>—</td></tr>`);
+  for(const number of data.numbers)
+    rows.push(`<tr class="${number.trusted?'':'untrusted'}"><td>number</td><td>${number.value}</td><td>${number.confidence.toFixed(3)}</td><td>${number.candidate_field_x.map(v=>`${v.toFixed(0)}`).join(' or ')} yd</td><td>${number.nearest_line_index==null?'—':`#${number.nearest_line_index}`}</td></tr>`);
+  $('debug-table').innerHTML=rows.join('');
+}
+async function inspectFrame(){
+  if(!state.shot)return;
+  const time=Number($('debug-time').value);
+  $('debug-status').textContent='Detecting lines and reading numbers…';
+  try{
+    const clip=encodeURIComponent(state.shot.clip_id);
+    const data=await json(`/api/clips/${clip}/field-detections?timestamp_s=${time}`);
+    state.fieldDebug=data;
+    const image=$('debug-image');
+    image.onload=()=>{drawFieldDebug();};
+    image.src=`/api/clips/${clip}/frame.jpg?timestamp_s=${time}`;
+    renderFieldDebug();
+    $('debug-status').textContent=`${data.lines.length} lines, ${data.numbers.length} numbers at ${data.timestamp_s.toFixed(2)}s`;
+  }catch(e){$('debug-status').textContent=e.message;}
+}
+$('debug-run').onclick=inspectFrame;
+$('debug-here').onclick=()=>{$('debug-time').value=$('film').currentTime.toFixed(2);inspectFrame();};
+window.addEventListener('resize',drawFieldDebug);

@@ -79,3 +79,49 @@ def test_game_and_static_endpoints(tmp_path: Path):
     assert response.status_code == 200
     calibration = client.get("/api/clips/c1/calibration").json()
     assert calibration["keyframes"][0]["field_points"][1] == [20, 0]
+
+
+def test_field_detection_debug_endpoint_reports_lines_numbers_and_ambiguity(tmp_path: Path):
+    """The debug view must expose the evidence behind absolute field position."""
+    import cv2
+    import numpy as np
+
+    database = tmp_path / "debug.sqlite3"
+    initialize(database)
+    # A synthetic field: green turf with white five-yard lines.
+    height, width = 360, 640
+    frame = np.full((height, width, 3), (60, 140, 70), dtype=np.uint8)
+    for x in range(80, width - 40, 90):
+        cv2.line(frame, (x, 30), (x, height - 30), (245, 245, 245), 3)
+    video = tmp_path / "film.mp4"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (width, height))
+    for _ in range(20):
+        writer.write(frame)
+    writer.release()
+    if not video.exists():  # codec unavailable in this environment
+        return
+    with transaction(database) as connection:
+        connection.execute("INSERT INTO games(game_id,video_path) VALUES('g',?)", (str(video),))
+        connection.execute(
+            """INSERT INTO clips(clip_id,game_id,angle,start_s,end_s,confidence)
+               VALUES('c1','g','sideline',0,1.5,.9)""")
+    client = TestClient(create_app(database, tmp_path / "trajectories", None))
+    response = client.get("/api/clips/c1/field-detections", params={"timestamp_s": .5})
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["frame_width"] == width and payload["frame_height"] == height
+    assert payload["lines"], "the detector should find the painted yard lines"
+    for line in payload["lines"]:
+        assert len(line["image_points"]) == 2
+    # No painted numbers exist here, so absolute position must stay unresolved
+    # rather than being asserted from the repeating lines alone.
+    assert payload["numbers"] == []
+    assert payload["numbers_credible"] is False
+    assert payload["absolute_x"] is False
+    # A frame image is served for the overlay.
+    image = client.get("/api/clips/c1/frame.jpg", params={"timestamp_s": .5})
+    assert image.status_code == 200
+    assert image.headers["content-type"] == "image/jpeg"
+    # Timestamps outside the shot are refused rather than silently clamped.
+    assert client.get("/api/clips/c1/field-detections", params={"timestamp_s": 99}).status_code == 422
+    assert client.get("/api/clips/missing/field-detections").status_code == 404

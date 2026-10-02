@@ -657,3 +657,90 @@ def auto_reconstruct_game(db_path: Path, game_id: str, output_root: Path,
         except (ValueError, RuntimeError) as error:
             results.append({"clip_id": clip_id, "status": "failed", "error": str(error)})
     return results
+
+
+def describe_field_detections(video_path: Path, timestamp_s: float, reader=None) -> dict:
+    """Report what field registration actually detected in one frame.
+
+    Built for debugging the absolute-position problem: yard lines repeat every
+    five yards, so a fit can be confident and still be placed wrongly. This
+    returns the raw evidence behind that decision -- the detected lines, every
+    recognised number with its confidence and whether it was believed, and the
+    yard value assigned to each line -- in image pixel coordinates the viewer
+    can draw directly.
+    """
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise ValueError(f"Could not open {video_path}")
+    try:
+        capture.set(cv2.CAP_PROP_POS_MSEC, float(timestamp_s) * 1000)
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+    if not ok:
+        raise ValueError(f"Could not decode a frame at {timestamp_s:.2f}s")
+    height, width = frame.shape[:2]
+    lines, mask, white = detect_yard_lines(frame)
+    # Line geometry is still worth showing when OCR is unavailable, and the
+    # absence of numbers is itself the finding: without them the five-yard
+    # ambiguity cannot be resolved.
+    ocr_error_message = None
+    try:
+        raw_numbers = read_field_numbers(frame, reader)
+    except RuntimeError as error:
+        raw_numbers = []
+        ocr_error_message = str(error)
+    credible = _credible_field_numbers(raw_numbers, frame.shape)
+    trusted = raw_numbers if credible else []
+    assigned: list[Optional[float]] = [None] * len(lines)
+    absolute = False
+    ocr_error = None
+    if lines:
+        field_x, absolute, ocr_error = _assign_field_x(lines, trusted)
+        assigned = [float(value) for value in field_x]
+    registration = None
+    verification = None
+    if lines:
+        try:
+            value = register_field(frame, reader=reader, numbers=trusted)
+            registration = {"confidence": value.confidence, "absolute_x": value.absolute_x,
+                            "diagnostics": value.diagnostics}
+            verification = value.diagnostics.get("verification")
+        except Exception as error:  # diagnostics must never break the viewer
+            registration = {"error": str(error)}
+    # Which line each number was snapped to, so a mis-snapped number is visible.
+    number_rows = []
+    if lines:
+        direction = lines[0][1] - lines[0][0]
+        direction = direction / max(float(np.linalg.norm(direction)), 1e-9)
+        normal = np.asarray([-direction[1], direction[0]])
+        coordinates = np.asarray([float(np.dot(line.mean(axis=0), normal)) for line in lines])
+        for number in raw_numbers:
+            projection = float(np.dot(np.asarray(number.center, dtype=float), normal))
+            index = int(np.argmin(abs(coordinates - projection)))
+            number_rows.append(index)
+    else:
+        number_rows = [None] * len(raw_numbers)
+    return {
+        "frame_width": int(width), "frame_height": int(height),
+        "lines": [{"index": index,
+                   "image_points": [[float(point[0]), float(point[1])] for point in line],
+                   "assigned_field_x": assigned[index]}
+                  for index, line in enumerate(lines)],
+        "numbers": [{"value": number.value, "center": [float(number.center[0]), float(number.center[1])],
+                     "confidence": float(number.confidence), "trusted": bool(credible),
+                     "nearest_line_index": number_rows[index] if index < len(number_rows) else None,
+                     # Each painted number is ambiguous between the two halves
+                     # of the field until something else resolves which side.
+                     "candidate_field_x": ([60.0] if number.value == 50
+                                           else [10.0 + number.value, 110.0 - number.value])}
+                    for index, number in enumerate(raw_numbers)],
+        "numbers_credible": bool(credible),
+        "absolute_x": bool(absolute),
+        "ocr_assignment_error": ocr_error,
+        "field_fraction": float((mask > 0).mean()),
+        "white_fraction": float((white > 0).mean()),
+        "registration": registration,
+        "verification": verification,
+        "ocr_unavailable": ocr_error_message,
+    }

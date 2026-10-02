@@ -35,6 +35,17 @@
           <button id="calibration-save">Save correction</button>
         </details>
       </fieldset>
+      <fieldset id="field-debug" hidden>
+        <legend>Field detection debug</legend>
+        <p>Every yard line and painted number the detector found in one frame, with the yard value each line was assigned. Yard lines repeat every five yards, so a fit can be confident and still be placed on the wrong line; the numbers are the only absolute cue.</p>
+        <label>Frame time<input id="debug-time" type="number" step="0.1"></label>
+        <button id="debug-run">Inspect frame</button>
+        <button id="debug-here">Use current video time</button>
+        <span id="debug-status"></span>
+        <div class="debug-stage"><img id="debug-image" alt="Frame under inspection"><canvas id="debug-overlay"></canvas></div>
+        <div id="debug-summary" class="debug-summary"></div>
+        <table id="debug-table" class="debug-table"></table>
+      </fieldset>
       <fieldset id="action-review" hidden>
         <legend>Action boundary validation</legend>
         <select id="action-select"></select>
