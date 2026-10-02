@@ -283,7 +283,8 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
             path = tracks_dir / f"{clip_id}.parquet"
             if not path.exists():
                 continue
-            tracks = pd.read_parquet(path)
+            all_tracks = pd.read_parquet(path)
+            tracks = all_tracks
             if "track_reliable" in tracks and bool(tracks.track_reliable.any()):
                 tracks = tracks[tracks.track_reliable].copy()
             ranked = []
@@ -296,8 +297,13 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                     type("Play", (), {"description": "", "play_type": answer.category})(),
                     unit, answer), row))
             selection_cost, selected = min(ranked, key=lambda value: value[0])
-            window = tracks[(tracks.video_timestamp >= float(selected["snap_s"])) &
-                            (tracks.video_timestamp <= float(selected["dead_s"]))].copy()
+            spatial_tracks = all_tracks
+            if "confidence" in spatial_tracks:
+                spatial_tracks = spatial_tracks[spatial_tracks.confidence >= .55]
+            window = spatial_tracks[(spatial_tracks.video_timestamp >= float(selected["snap_s"])) &
+                                    (spatial_tracks.video_timestamp <= float(selected["dead_s"]))].copy()
+            identity_window = tracks[(tracks.video_timestamp >= float(selected["snap_s"])) &
+                                     (tracks.video_timestamp <= float(selected["dead_s"]))].copy()
             truth = pd.read_sql_query(
                 """SELECT frame_id,nfl_id,x,y,event FROM bdb_tracking
                    WHERE game_id=? AND play_id=? AND nfl_id IS NOT NULL ORDER BY frame_id""",
@@ -337,7 +343,7 @@ def evaluate_audited_sources(db_path: Path, game_id: str, tracks_dir: Path) -> d
                 window, truth, float(selected["snap_s"]), bdb_snap, offset,
                 flip_x, flip_y, shift_x)
             identities = identity_metrics(
-                window, truth, float(selected["snap_s"]), bdb_snap, offset,
+                identity_window, truth, float(selected["snap_s"]), bdb_snap, offset,
                 flip_x, flip_y, shift_x, bdb_refinement["correction_matrix"])
             results.append({
                 "clip_id": clip_id, "bdb_play_id": play_id, "action_id": selected["action_id"],
