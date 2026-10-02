@@ -56,18 +56,44 @@
       </fieldset>
 
       <fieldset>
+        <legend>Yard-line rows</legend>
+        <label class="slider">White brightness <output data-for="brightness"></output>
+          <input type="range" id="brightness" min="80" max="240" step="5" value="150">
+        </label>
+        <label class="slider">Maximum saturation <output data-for="maximum_saturation"></output>
+          <input type="range" id="maximum_saturation" min="20" max="220" step="5" value="115">
+        </label>
+        <label class="slider">Angle tolerance <output data-for="angle_tolerance"></output>
+          <input type="range" id="angle_tolerance" min="1" max="20" step="1" value="7">
+        </label>
+        <label class="slider">Alignment tolerance <output data-for="alignment_tolerance"></output>
+          <input type="range" id="alignment_tolerance" min="2" max="50" step="1" value="12">
+        </label>
+        <label class="slider">Minimum fragments <output data-for="minimum_fragments"></output>
+          <input type="range" id="minimum_fragments" min="2" max="12" step="1" value="3">
+        </label>
+        <label class="slider">Minimum frame span <output data-for="minimum_span_ratio"></output>
+          <input type="range" id="minimum_span_ratio" min="0.05" max="0.8" step="0.01" value="0.50">
+        </label>
+        <label class="slider">Minimum paint coverage <output data-for="minimum_coverage"></output>
+          <input type="range" id="minimum_coverage" min="0.05" max="1" step="0.01" value="0.45">
+        </label>
+      </fieldset>
+
+      <fieldset>
         <legend>Drawing</legend>
         <label class="slider">Line thickness <output data-for="thickness"></output>
           <input type="range" id="thickness" min="1" max="8" step="1" value="2">
         </label>
-        <label class="check"><input type="checkbox" id="draw_lines" checked> Draw detected lines</label>
+        <label class="check"><input type="checkbox" id="yard_lines_only" checked> Yard-line rows only</label>
+        <label class="check"><input type="checkbox" id="draw_lines"> Draw all raw lines</label>
         <label class="check"><input type="checkbox" id="show_edges"> Show Canny edges</label>
       </fieldset>
 
       <button id="reset" type="button">Reset parameters</button>
-      <p class="note">Lines are coloured by orientation, so parallel families share a hue.
-        This is the raw probabilistic Hough transform on the whole frame: no field mask,
-        no clustering, and no yard-line interpretation.</p>
+      <p class="note">Yard-line mode keeps low-saturation bright fragments, groups fragments
+        that are parallel and collinear, then draws only long rows supported by several fragments.
+        Disable it to inspect every raw Hough segment.</p>
     </aside>
 
     <section class="stage">

@@ -1,9 +1,14 @@
 'use strict';
 
 const PARAMETERS = ['blur', 'canny_low', 'canny_high', 'threshold',
-                    'min_line_length', 'max_line_gap', 'thickness'];
+                    'min_line_length', 'max_line_gap', 'brightness', 'maximum_saturation',
+                    'angle_tolerance', 'alignment_tolerance', 'minimum_fragments',
+                    'minimum_span_ratio', 'minimum_coverage', 'thickness'];
 const DEFAULTS = {blur: 5, canny_low: 50, canny_high: 150, threshold: 45,
-                  min_line_length: 60, max_line_gap: 35, thickness: 2};
+                  min_line_length: 60, max_line_gap: 35, brightness: 150,
+                  maximum_saturation: 115, angle_tolerance: 7, alignment_tolerance: 12,
+                  minimum_fragments: 3, minimum_span_ratio: .50,
+                  minimum_coverage: .45, thickness: 2};
 const FRAME_STEP_S = 1 / 25;
 const escapeHtml = (value) => String(value)
   .replaceAll('&', '&amp;')
@@ -32,6 +37,7 @@ function parameterValues() {
   for (const name of PARAMETERS) values[name] = Number(element(name).value);
   values.show_edges = element('show_edges').checked;
   values.draw_lines = element('draw_lines').checked;
+  values.yard_lines_only = element('yard_lines_only').checked;
   return values;
 }
 
@@ -51,13 +57,16 @@ function query(values, extra) {
   if (extra) {
     parameters.set('show_edges', values.show_edges);
     parameters.set('draw_lines', values.draw_lines);
+    parameters.set('yard_lines_only', values.yard_lines_only);
   }
   return parameters.toString();
 }
 
 function renderStats(payload) {
   const stats = [
-    ['Lines', payload.count],
+    ['Yard rows', payload.yard_line_count],
+    ['White fragments', payload.white_fragment_count],
+    ['Raw lines', payload.count],
     ['Longest', `${payload.longest} px`],
     ['Median', `${payload.median_length} px`],
     ['Frame', `${payload.width}×${payload.height}`],
@@ -103,7 +112,8 @@ async function refresh() {
     const payload = await response.json();
     frame.src = image.src;
     renderStats(payload);
-    setStatus(`${payload.count} lines · ${current.clip_id} · ${current.angle}`);
+    setStatus(`${payload.yard_line_count} yard-line rows · ${payload.count} raw lines · ` +
+      `${current.clip_id} · ${current.angle}`);
   } catch (error) {
     if (token === pending) setStatus(error.message, true);
   } finally {
@@ -169,7 +179,7 @@ time.addEventListener('input', () => { syncOutputs(); refreshSoon(); });
 for (const name of PARAMETERS) {
   element(name).addEventListener('input', () => { syncOutputs(); refreshSoon(); });
 }
-for (const name of ['show_edges', 'draw_lines']) {
+for (const name of ['show_edges', 'draw_lines', 'yard_lines_only']) {
   element(name).addEventListener('change', refresh);
 }
 for (const button of document.querySelectorAll('.stepper button')) {

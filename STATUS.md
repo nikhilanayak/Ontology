@@ -347,3 +347,21 @@ interpretation, calibration, detection, or tracking dependency.
   clips, and `bills-at-rams-2022-reg-1:0005/annotated.jpg` returned 200 (**275,368 bytes**).
 - The unrelated pre-existing local modification in `src/all22/field_registration.py` remains
   preserved and was not included in `55c075e`.
+
+### Yard-line row filtering (local, uncommitted — 2026-10-02)
+
+Added a yard-line-only mode over the raw Hough output. It masks for bright, low-saturation paint,
+groups fragments that agree in angle and normal offset, fits one segment through each collinear
+row, deduplicates stripe edges, requires several fragments, long frame span, and minimum continuous
+paint coverage, then uses the registered shot angle to choose steep cross-field rows in sideline
+film and horizontal rows in end-zone film. The raw-lines mode remains available for comparison.
+
+- Preview controls now expose white brightness/saturation, angle/alignment tolerances, fragment
+  count, frame span, and paint coverage; yard-line rows are the default drawing layer.
+- Synthetic tests cover fragmented rows, isolated-shape rejection, diagnostics, and API rendering.
+  Full local suite: `.venv/bin/python -m pytest -q` — **109 passed**, one existing warning.
+- Bounded real probe used the same six `start_s + 0.3` frames as the raw Hough experiment. On
+  Bills-Rams clip `0005`, camera-angle filtering changed the selected family from horizontal
+  hash/number rows to the steep cross-field stripe family; the default 50% frame-span gate removes
+  short player/number strokes. Probe images remain private in production `.runtime/`.
+- Deployment state: **local only, uncommitted, not deployed**.

@@ -72,6 +72,45 @@ def test_describe_reports_segments_and_diagnostics():
     assert payload["parameters"]["threshold"] == hough.HoughParameters().threshold
 
 
+def test_yard_line_rows_keep_long_collinear_white_fragments():
+    image = np.full((480, 800, 3), (55, 130, 55), dtype=np.uint8)
+    for y in (100, 220, 340):
+        for x1, x2 in ((40, 180), (215, 390), (430, 610), (650, 760)):
+            cv2.line(image, (x1, y), (x2, y), (245, 245, 245), 4)
+    cv2.rectangle(image, (300, 30), (360, 80), (245, 245, 245), 4)
+    cv2.line(image, (50, 430), (120, 380), (20, 20, 220), 5)
+    fragments, rows = hough.find_yard_line_rows(
+        image,
+        hough.HoughParameters(min_line_length=35, max_line_gap=10, threshold=30),
+        hough.YardLineParameters(minimum_fragments=3, minimum_span_ratio=.4),
+    )
+    assert len(fragments) > len(rows)
+    assert len(rows) >= 3
+    segments = hough.yard_line_segments(rows)
+    assert np.all((hough.segment_angles_degrees(segments) < 3) |
+                  (hough.segment_angles_degrees(segments) > 177))
+    assert hough.segment_lengths(segments).min() > 500
+    assert all(row["fragments"] >= 3 for row in rows)
+
+
+def test_yard_line_rows_reject_isolated_white_shapes():
+    image = np.zeros((360, 640, 3), dtype=np.uint8)
+    cv2.rectangle(image, (100, 100), (180, 180), (255, 255, 255), 3)
+    cv2.circle(image, (400, 200), 40, (255, 255, 255), 3)
+    _, rows = hough.find_yard_line_rows(
+        image, yard_parameters=hough.YardLineParameters(minimum_span_ratio=.5)
+    )
+    assert rows == []
+    assert hough.yard_line_segments(rows).shape == (0, 4)
+
+
+def test_describe_includes_grouped_yard_line_diagnostics():
+    payload = hough.describe(frame_with_lines())
+    assert payload["white_fragment_count"] >= payload["yard_line_count"]
+    assert "yard_lines" in payload
+    assert payload["yard_parameters"]["minimum_fragments"] == 3
+
+
 def test_encode_jpeg_produces_a_decodable_image():
     data = hough.encode_jpeg(frame_with_lines())
     assert data[:2] == b"\xff\xd8"

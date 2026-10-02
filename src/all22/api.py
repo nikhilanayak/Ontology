@@ -507,6 +507,16 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def _yard_parameters(brightness: int, maximum_saturation: int, angle_tolerance: float,
+                         alignment_tolerance: float,                          minimum_fragments: int, minimum_span_ratio: float,
+                         minimum_coverage: float) -> "hough.YardLineParameters":
+        return hough.YardLineParameters(
+            brightness=brightness, maximum_saturation=maximum_saturation,
+            angle_tolerance=angle_tolerance, alignment_tolerance=alignment_tolerance,
+            minimum_fragments=minimum_fragments, minimum_span_ratio=minimum_span_ratio,
+            minimum_coverage=minimum_coverage,
+        ).normalized()
+
     @app.get("/api/hough/clips/{clip_id}/lines")
     def hough_lines(clip_id: str, timestamp_s: Optional[float] = None,
                     blur: int = Query(5, ge=0, le=31),
@@ -514,12 +524,22 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
                     canny_high: int = Query(150, ge=1, le=1000),
                     threshold: int = Query(45, ge=1, le=500),
                     min_line_length: int = Query(60, ge=1, le=2000),
-                    max_line_gap: int = Query(35, ge=0, le=500)):
-        """Return raw Hough segments for one frame, with no field interpretation."""
+                    max_line_gap: int = Query(35, ge=0, le=500),
+                    brightness: int = Query(150, ge=0, le=255),
+                    maximum_saturation: int = Query(115, ge=0, le=255),
+                    angle_tolerance: float = Query(7, ge=1, le=30),
+                    alignment_tolerance: float = Query(12, ge=1, le=100),
+                    minimum_fragments: int = Query(3, ge=2, le=30),
+                    minimum_span_ratio: float = Query(.50, ge=.05, le=1),
+                    minimum_coverage: float = Query(.45, ge=.05, le=1)):
+        """Return raw Hough segments and grouped yard-line candidates for one frame."""
         frame, meta = _hough_clip_frame(clip_id, timestamp_s)
         parameters = _hough_parameters(blur, canny_low, canny_high, threshold,
                                        min_line_length, max_line_gap)
-        return {**meta, **hough.describe(frame, parameters)}
+        yard = _yard_parameters(brightness, maximum_saturation, angle_tolerance,
+                                alignment_tolerance, minimum_fragments, minimum_span_ratio,
+                                minimum_coverage)
+        return {**meta, **hough.describe(frame, parameters, yard, meta["angle"])}
 
     @app.get("/api/hough/clips/{clip_id}/annotated.jpg")
     def hough_annotated(clip_id: str, timestamp_s: Optional[float] = None,
@@ -529,14 +549,30 @@ def create_app(db_path: Path, trajectories_dir: Path, static_dir: Optional[Path]
                         threshold: int = Query(45, ge=1, le=500),
                         min_line_length: int = Query(60, ge=1, le=2000),
                         max_line_gap: int = Query(35, ge=0, le=500),
+                        brightness: int = Query(150, ge=0, le=255),
+                        maximum_saturation: int = Query(115, ge=0, le=255),
+                        angle_tolerance: float = Query(7, ge=1, le=30),
+                        alignment_tolerance: float = Query(12, ge=1, le=100),
+                        minimum_fragments: int = Query(3, ge=2, le=30),
+                        minimum_span_ratio: float = Query(.50, ge=.05, le=1),
+                        minimum_coverage: float = Query(.45, ge=.05, le=1),
                         thickness: int = Query(2, ge=1, le=10),
-                        show_edges: bool = False, draw_lines: bool = True):
-        """Return the frame with Hough segments drawn over it as a JPEG."""
-        frame, _ = _hough_clip_frame(clip_id, timestamp_s)
+                        show_edges: bool = False, draw_lines: bool = False,
+                        yard_lines_only: bool = True):
+        """Return the frame with raw or grouped yard-line Hough segments drawn over it."""
+        frame, meta = _hough_clip_frame(clip_id, timestamp_s)
         parameters = _hough_parameters(blur, canny_low, canny_high, threshold,
                                        min_line_length, max_line_gap)
-        segments = hough.detect_lines(frame, parameters) if draw_lines \
-            else np.empty((0, 4), dtype=np.int32)
+        yard = _yard_parameters(brightness, maximum_saturation, angle_tolerance,
+                                alignment_tolerance, minimum_fragments, minimum_span_ratio,
+                                minimum_coverage)
+        if yard_lines_only:
+            _, rows = hough.find_yard_line_rows(frame, parameters, yard, meta["angle"])
+            segments = hough.yard_line_segments(rows)
+        elif draw_lines:
+            segments = hough.detect_lines(frame, parameters)
+        else:
+            segments = np.empty((0, 4), dtype=np.int32)
         image = hough.annotate(frame, segments, thickness=thickness,
                                show_edges=show_edges, parameters=parameters)
         return Response(content=hough.encode_jpeg(image), media_type="image/jpeg",
