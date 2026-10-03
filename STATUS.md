@@ -348,7 +348,7 @@ interpretation, calibration, detection, or tracking dependency.
 - The unrelated pre-existing local modification in `src/all22/field_registration.py` remains
   preserved and was not included in `55c075e`.
 
-### Yard-line row filtering (local, uncommitted — 2026-10-02)
+### Yard-line row filtering (deployed `3395fc2` — 2026-10-02)
 
 Added a yard-line-only mode over the raw Hough output. It masks for bright, low-saturation paint,
 groups fragments that agree in angle and normal offset, fits one segment through each collinear
@@ -364,4 +364,7 @@ film and horizontal rows in end-zone film. The raw-lines mode remains available 
   Bills-Rams clip `0005`, camera-angle filtering changed the selected family from horizontal
   hash/number rows to the steep cross-field stripe family; the default 50% frame-span gate removes
   short player/number strokes. Probe images remain private in production `.runtime/`.
-- Deployment state: **local only, uncommitted, not deployed**.
+- Deployment: committed and pushed as **`3395fc2`**; production full suite **109 passed** with
+  one existing warning. Viewer restarted and verified: `/hough` 200; Bills-Rams `0005` reported
+  512 raw lines, 1,472 white fragments, and **10** filtered yard-line rows at the shot start;
+  the default yard-only annotated JPEG returned 200 (**247,765 bytes**).
